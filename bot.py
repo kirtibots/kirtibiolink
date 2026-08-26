@@ -4,6 +4,8 @@ import time
 import logging
 from collections import defaultdict, deque
 import motor.motor_asyncio
+from telethon import TelegramClient, events
+from telethon.tl.functions.users import GetFullUserRequest
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -18,6 +20,8 @@ LOG_CHAT = os.getenv("LOG_CHAT_ID", "")
 
 MONGO_DB_URI = os.getenv("MONGO_DB_URI", "").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "shield_guard")
+TG_API_ID = int(os.getenv("TG_API_ID", "0") or 0)
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
 DB_PATH = os.getenv("DB_PATH", "shieldbot.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -65,6 +69,7 @@ ABUSE_WORDS = {
 }
 LINK_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.I)
 flood_cache = defaultdict(lambda: defaultdict(deque))
+bio_client = None
 
 
 async def init_db():
@@ -263,12 +268,11 @@ async def start(update, context):
 HELP = {
 "help_link": "🔗 <b>LINK DEL</b>\n\n/antilink on|off\nDeletes detected links from non-admin users.",
 "help_admin": "🛡️ <b>ADMIN DETECT</b>\n\n/warn /warnings /unwarn /ban /unban USER_ID /kick /mute [minutes] /unmute /purge [count]",
-"help_broadcast": "📢 <b>BROADCAST</b>\n\n/broadcast MESSAGE\nOwner-only placeholder; mass messaging is disabled in this build.",
 "help_other": "⚙️ <b>OTHER</b>\n\n/start /help /settings /antispam on|off",
 "help_local_auth": "🔐 <b>LOCAL AUTH</b>\n\n/auth USER_ID\n/unauth USER_ID\n/authlist",
 "help_global_auth": "🌐 <b>GLOBAL AUTH</b>\n\n/gauth USER_ID\n/gunauth USER_ID\n/gauthlist",
 "help_edit_delete": "✏️ <b>EDIT DELETE</b>\n\n/editdelete on|off",
-"help_bio_link": "🔗 <b>BIO LINK</b>\n\n/biolink on|off",
+"help_bio_link": "🔗 <b>BIO LINK</b>\n\n/biolink on|off\n\nDeletes messages from users whose Telegram bio contains a link. Requires TG_API_ID and TG_API_HASH.",
 "help_media_del": "🧹 <b>MEDIA DEL</b>\n\n/mediadel on|off",
 "help_no_abuse": "🛡️ <b>NO ABUSE</b>\n\n/noabuse on|off"
 }
@@ -278,8 +282,7 @@ def help_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("LINK DEL", callback_data="help_link"),
          InlineKeyboardButton("ADMIN DETECT", callback_data="help_admin")],
-        [InlineKeyboardButton("BROADCAST", callback_data="help_broadcast"),
-         InlineKeyboardButton("OTHER", callback_data="help_other")],
+        [InlineKeyboardButton("OTHER", callback_data="help_other")],
         [InlineKeyboardButton("LOCAL AUTH", callback_data="help_local_auth"),
          InlineKeyboardButton("GLOBAL AUTH", callback_data="help_global_auth")],
         [InlineKeyboardButton("EDIT DELETE", callback_data="help_edit_delete"),
@@ -521,12 +524,65 @@ async def gauthlist(update, context):
     await update.message.reply_text("🌐 GLOBAL AUTH\n\n" + ("\n".join(map(str,ids)) if ids else "None"))
 
 
-async def broadcast(update, context):
-    if update.effective_user.id != OWNER_ID: return await update.message.reply_text("❌ Owner only.")
-    await update.message.reply_text("📢 Broadcast is disabled in this build.")
 
 
+def bio_contains_link(text):
+    if not text:
+        return False
+    return bool(re.search(r"(https?://|www\.|t\.me/|telegram\.me/)", text, re.I))
 
+
+async def get_bio_setting(chat_id):
+    return bool((await get_settings(chat_id))[5])
+
+
+async def start_bio_guard():
+    global bio_client
+    if not TG_API_ID or not TG_API_HASH or not TOKEN:
+        log.warning("Bio-link guard disabled: TG_API_ID/TG_API_HASH missing.")
+        return
+
+    bio_client = TelegramClient(
+        "shield_guard_bio", TG_API_ID, TG_API_HASH,
+        device_model="Shield Guard", system_version="Heroku", app_version="1.0"
+    )
+    await bio_client.start(bot_token=TOKEN)
+
+    @bio_client.on(events.NewMessage(incoming=True))
+    async def bio_message_handler(event):
+        try:
+            if not event.is_group or not await get_bio_setting(event.chat_id):
+                return
+
+            sender = await event.get_sender()
+            if not sender or getattr(sender, "bot", False) or sender.id == OWNER_ID:
+                return
+
+            try:
+                perms = await bio_client.get_permissions(event.chat_id, sender.id)
+                if getattr(perms, "is_admin", False):
+                    return
+            except Exception:
+                pass
+
+            full = await bio_client(GetFullUserRequest(sender))
+            bio = getattr(full.full_user, "about", "") or ""
+
+            if bio_contains_link(bio):
+                await event.delete()
+                log.info("Bio-link message deleted: chat=%s user=%s", event.chat_id, sender.id)
+        except Exception as exc:
+            log.warning("Bio-link check failed: %s", exc)
+
+
+async def stop_bio_guard():
+    global bio_client
+    if bio_client:
+        try:
+            await bio_client.disconnect()
+        except Exception:
+            pass
+        bio_client = None
 
 async def on_message(update, context):
     m=update.effective_message
@@ -603,7 +659,6 @@ def main():
         ("unban",unban),("kick",kick),("mute",mute),("unmute",unmute),("purge",purge),
         ("auth",auth),("unauth",unauth),("authlist",authlist),
         ("gauth",gauth),("gunauth",gunauth),("gauthlist",gauthlist),
-        ("broadcast",broadcast)
     ]:
         app.add_handler(CommandHandler(cmd,func))
 
@@ -614,7 +669,10 @@ def main():
 
     async def post_init(application):
         await init_db()
+        await start_bio_guard()
+
     async def post_shutdown(application):
+        await stop_bio_guard()
         await close_db()
     app.post_init=post_init
     app.post_shutdown=post_shutdown
