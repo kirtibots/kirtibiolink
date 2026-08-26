@@ -1,52 +1,63 @@
-# Shield Guard — Telegram Security Bot
+<p align="center">
+<b>𝗗𝗘𝗣𝗟𝗢𝗬𝗠𝗘𝗡𝗧 𝗠𝗘𝗧𝗛𝗢𝗗𝗦</b>
+</p>
 
-A clean, self-hosted Telegram group moderation bot inspired by common Shield-style security bots. It is an independent implementation, not the source code of @ShieldronBot.
+<h3 align="center">
+    ─「 ᴅᴇᴩʟᴏʏ ᴏɴ ʜᴇʀᴏᴋᴜ 」─
+</h3>
 
-## Features
-- Anti-link
-- Anti-flood
-- Warning system with automatic ban
-- Ban / unban / kick
-- Temporary mute / unmute
-- Purge
-- Admin-only controls
-- SQLite persistence
-- Optional moderation log chat
+<p align="center"><a href="https://dashboard.heroku.com/new?template=https://github.com/opk00637-glitch/Kriti-"> <img src="https://www.herokucdn.com/deploy/button.svg"></a></p>
 
-## Setup
-1. Create a bot with Telegram @BotFather.
-2. Add it to your group as an administrator.
-3. Give it permission to delete messages, ban users and restrict members.
-4. Copy `.env.example` to `.env` and set `BOT_TOKEN`.
-5. Install dependencies:
-   `pip install -r requirements.txt`
-6. Run:
-   `python bot.py`
+<br />
 
-## Commands
-- `/settings`
-- `/antilink on|off`
-- `/antispam on|off`
-- `/warn` (reply)
-- `/warnings` (reply)
-- `/unwarn` (reply)
-- `/ban` (reply)
-- `/unban USER_ID`
-- `/kick` (reply)
-- `/mute [minutes]` (reply)
-- `/unmute` (reply)
-- `/purge [count]`
+---
 
-## Important
-For message moderation, configure the bot's Telegram privacy/admin permissions appropriately. Do not put your real bot token into source control.
+### 🔧 Quick Setup
 
+1. **Upgrade & Update:**
+   ```bash
+   sudo apt-get update && sudo apt-get upgrade -y
+   ```
 
-## Heroku deployment
-1. Create a new Heroku app.
-2. Deploy this folder/repository using Heroku Git or GitHub deployment.
-3. In **Settings → Config Vars**, set `BOT_TOKEN` to your BotFather token.
-4. Optionally set `LOG_CHAT_ID`.
-5. In **Resources**, enable the `worker` dyno.
-6. Add the bot to your Telegram group as an administrator with permission to delete messages, ban users, and restrict members.
+2. **Install Required Packages:**
+   ```bash
+   sudo apt-get install python3-pip ffmpeg -y
+   ```
+3. **Setting up PIP**
+   ```bash
+   sudo pip3 install -U pip
+   ```
+4. **Installing Node**
+   ```bash
+   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.38.0/install.sh | bash && source ~/.bashrc && nvm install v18
+   ```
+5. **Clone the Repository**
+   ```bash
+   git clone https://github.com/Badnam019/KRITIMUSIC && cd KRITIMUSIC
+   ```
+6. **Install Requirements**
+   ```bash
+   pip3 install -U -r requirements.txt
+   ```
+7. **Create .env  with sample.env**
+   ```bash
+   cp sample.env .env
+   ```
+   - Edit .env with your vars
+8. **Editing Vars:**
+   ```bash
+   vi .env
+   ```
+   - Edit .env with your values.
+   - Press `I` button on keyboard to start editing.
+   - Press `Ctrl + C`  once you are done with editing vars and type `:wq` to save .env or `:qa` to exit editing.
+9. **Installing tmux**
+    ```bash
+    sudo apt install tmux -y && tmux
+    ```
+10. **Run the Bot**
+    ```bash
+    bash start
+    ```
 
-The bot uses polling, so the worker process should be enabled.
+---
