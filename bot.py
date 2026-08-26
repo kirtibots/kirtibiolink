@@ -27,17 +27,17 @@ from telegram.ext import (
 # =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "8857291657") or 0)
 
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "YourOwnerUsername").strip().lstrip("@")
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "YourSupportUsername").strip().lstrip("@")
 
-LOG_CHAT = os.getenv("LOG_CHAT_ID", "").strip()
+LOG_CHAT = os.getenv("LOG_CHAT_ID", "-1003979103138").strip()
 DB_PATH = os.getenv("DB_PATH", "shieldbot.db").strip()
 
 # Telegram file_id or direct image URL.
-START_IMAGE = os.getenv("START_IMAGE", "").strip()
-HELP_IMAGE = os.getenv("HELP_IMAGE", "").strip()
+START_IMAGE = os.getenv("START_IMAGE", "https://h.uguu.se/FekWWcsz.jpg").strip()
+HELP_IMAGE = os.getenv("HELP_IMAGE", "https://h.uguu.se/FekWWcsz.jpg").strip()
 
 logging.basicConfig(
     level=logging.INFO,
