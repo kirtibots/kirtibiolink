@@ -1,12 +1,31 @@
 {
   "name": "Shield Guard Telegram Bot",
   "description": "Telegram group security and moderation bot",
-  "repository": "",
-  "keywords": ["telegram", "moderation", "antispam", "heroku", "python"],
+  "keywords": [
+    "telegram",
+    "moderation",
+    "antispam",
+    "heroku",
+    "python"
+  ],
   "env": {
     "BOT_TOKEN": {
       "description": "Telegram bot token from @BotFather",
       "required": true
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram numeric user ID for owner-only commands",
+      "required": true
+    },
+    "OWNER_USERNAME": {
+      "description": "Owner Telegram username without @",
+      "required": false,
+      "value": "YourOwnerUsername"
+    },
+    "SUPPORT_USERNAME": {
+      "description": "Support Telegram username without @",
+      "required": false,
+      "value": "YourSupportUsername"
     },
     "LOG_CHAT_ID": {
       "description": "Optional Telegram chat ID for moderation logs",
@@ -17,6 +36,31 @@
       "description": "SQLite database path",
       "required": false,
       "value": "shieldbot.db"
+    },
+    "SIGHTENGINE_USER": {
+      "description": "Sightengine API user for NSFW moderation",
+      "required": false,
+      "value": ""
+    },
+    "SIGHTENGINE_SECRET": {
+      "description": "Sightengine API secret for NSFW moderation",
+      "required": false,
+      "value": ""
+    },
+    "NSFW_THRESHOLD": {
+      "description": "NSFW deletion threshold, e.g. 0.70",
+      "required": false,
+      "value": "0.70"
+    },
+    "MONGO_DB_URI": {
+      "description": "MongoDB Atlas connection string",
+      "required": false,
+      "value": ""
+    },
+    "MONGO_DB_NAME": {
+      "description": "MongoDB database name",
+      "required": false,
+      "value": "shield_guard"
     }
   },
   "formation": {
