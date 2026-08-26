@@ -1,64 +1,248 @@
-import os, re, time, sqlite3, logging
+import os
+import re
+import time
+import io
+import asyncio
+import logging
 from collections import defaultdict, deque
+
+import requests
+import motor.motor_asyncio
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
 TOKEN = os.getenv("BOT_TOKEN", "")
-DB_PATH = os.getenv("DB_PATH", "shieldbot.db")
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "YourOwnerUsername")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "YourSupportUsername")
 LOG_CHAT = os.getenv("LOG_CHAT_ID", "")
+
+MONGO_DB_URI = os.getenv("MONGO_DB_URI", "").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "shield_guard")
+DB_PATH = os.getenv("DB_PATH", "shieldbot.db")
+
+SIGHTENGINE_USER = os.getenv("SIGHTENGINE_USER", "")
+SIGHTENGINE_SECRET = os.getenv("SIGHTENGINE_SECRET", "")
+NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.70") or 0.70)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("shieldbot")
 
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.execute("""CREATE TABLE IF NOT EXISTS settings(
-    chat_id INTEGER PRIMARY KEY, links INTEGER DEFAULT 1, flood INTEGER DEFAULT 1,
-    welcome INTEGER DEFAULT 0, max_warns INTEGER DEFAULT 3
-)""")
-db.execute("""CREATE TABLE IF NOT EXISTS warns(
-    chat_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0,
-    PRIMARY KEY(chat_id,user_id)
-)""")
-db.commit()
+mongo_client = None
+mongo = None
+settings_col = warns_col = local_auth_col = global_auth_col = None
+sqlite_db = None
 
-flood_cache = defaultdict(lambda: defaultdict(deque))
+if MONGO_DB_URI:
+    mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
+        MONGO_DB_URI, serverSelectionTimeoutMS=8000, connectTimeoutMS=8000
+    )
+    mongo = mongo_client[MONGO_DB_NAME]
+    settings_col = mongo["settings"]
+    warns_col = mongo["warns"]
+    local_auth_col = mongo["local_auth"]
+    global_auth_col = mongo["global_auth"]
+else:
+    import sqlite3
+    sqlite_db = sqlite3.connect(DB_PATH, check_same_thread=False)
+    sqlite_db.execute("""CREATE TABLE IF NOT EXISTS settings(
+        chat_id INTEGER PRIMARY KEY, links INTEGER DEFAULT 1, flood INTEGER DEFAULT 1,
+        welcome INTEGER DEFAULT 0, max_warns INTEGER DEFAULT 3, edit_delete INTEGER DEFAULT 0,
+        bio_link INTEGER DEFAULT 0, media_del INTEGER DEFAULT 0, no_abuse INTEGER DEFAULT 0,
+        nsfw INTEGER DEFAULT 0)""")
+    sqlite_db.execute("""CREATE TABLE IF NOT EXISTS warns(
+        chat_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0,
+        PRIMARY KEY(chat_id,user_id))""")
+    sqlite_db.execute("""CREATE TABLE IF NOT EXISTS local_auth(
+        chat_id INTEGER, user_id INTEGER, PRIMARY KEY(chat_id,user_id))""")
+    sqlite_db.execute("""CREATE TABLE IF NOT EXISTS global_auth(
+        user_id INTEGER PRIMARY KEY)""")
+    sqlite_db.commit()
+
+DEFAULT_SETTINGS = {
+    "links": 1, "flood": 1, "welcome": 0, "max_warns": 3,
+    "edit_delete": 0, "bio_link": 0, "media_del": 0, "no_abuse": 0, "nsfw": 0
+}
+
+ABUSE_WORDS = {
+    "fuck", "fucking", "motherfucker", "bitch", "bastard", "asshole",
+    "idiot", "stupid", "mc", "bc", "bsdk", "chutiya", "gali",
+    "madarchod", "bhenchod", "behenchod", "harami"
+}
 LINK_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.I)
+flood_cache = defaultdict(lambda: defaultdict(deque))
 
-def settings(chat_id):
-    row=db.execute("SELECT links,flood,welcome,max_warns FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
+
+async def init_db():
+    if mongo is not None:
+        await mongo_client.admin.command("ping")
+        await settings_col.create_index("chat_id", unique=True)
+        await warns_col.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
+        await local_auth_col.create_index([("chat_id", 1), ("user_id", 1)], unique=True)
+        await global_auth_col.create_index("user_id", unique=True)
+        log.info("MongoDB connected: %s", MONGO_DB_NAME)
+    else:
+        log.info("SQLite fallback database active")
+
+
+async def close_db():
+    if mongo_client:
+        mongo_client.close()
+
+
+async def get_settings(chat_id):
+    if mongo is not None:
+        row = await settings_col.find_one({"chat_id": chat_id})
+        if not row:
+            doc = {"chat_id": chat_id, **DEFAULT_SETTINGS}
+            await settings_col.insert_one(doc)
+            return tuple(doc[k] for k in DEFAULT_SETTINGS)
+        return tuple(row.get(k, v) for k, v in DEFAULT_SETTINGS.items())
+
+    row = sqlite_db.execute(
+        "SELECT links,flood,welcome,max_warns,edit_delete,bio_link,media_del,no_abuse,nsfw "
+        "FROM settings WHERE chat_id=?", (chat_id,)
+    ).fetchone()
     if not row:
-        db.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,))
-        db.commit()
-        return (1,1,0,3)
+        sqlite_db.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,))
+        sqlite_db.commit()
+        return tuple(DEFAULT_SETTINGS.values())
     return row
 
-def is_admin(update: Update):
-    return bool(update.effective_chat and update.effective_user and
-                update.effective_chat.get_member(update.effective_user.id).status in ("administrator","creator"))
 
-async def admin(update, user_id=None):
-    if not update.effective_chat or not update.effective_user:
+async def set_setting(chat_id, field, value):
+    if field not in DEFAULT_SETTINGS:
+        return
+    if mongo is not None:
+        await settings_col.update_one(
+            {"chat_id": chat_id}, {"$set": {field: int(value)}}, upsert=True
+        )
+    else:
+        sqlite_db.execute(f"UPDATE settings SET {field}=? WHERE chat_id=?", (int(value), chat_id))
+        sqlite_db.commit()
+
+
+async def get_warn_count(chat_id, user_id):
+    if mongo is not None:
+        row = await warns_col.find_one({"chat_id": chat_id, "user_id": user_id})
+        return int(row["count"]) if row else 0
+    row = sqlite_db.execute(
+        "SELECT count FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+async def set_warn_count(chat_id, user_id, count):
+    if mongo is not None:
+        if count <= 0:
+            await warns_col.delete_one({"chat_id": chat_id, "user_id": user_id})
+        else:
+            await warns_col.update_one(
+                {"chat_id": chat_id, "user_id": user_id},
+                {"$set": {"count": int(count)}}, upsert=True
+            )
+    else:
+        if count <= 0:
+            sqlite_db.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id,user_id))
+        else:
+            sqlite_db.execute(
+                "INSERT OR REPLACE INTO warns VALUES(?,?,?)",
+                (chat_id,user_id,int(count))
+            )
+        sqlite_db.commit()
+
+
+async def local_auth_add(chat_id, user_id):
+    if mongo is not None:
+        await local_auth_col.update_one(
+            {"chat_id": chat_id, "user_id": user_id},
+            {"$set": {"chat_id": chat_id, "user_id": user_id}}, upsert=True
+        )
+    else:
+        sqlite_db.execute("INSERT OR IGNORE INTO local_auth VALUES(?,?)", (chat_id,user_id))
+        sqlite_db.commit()
+
+
+async def local_auth_remove(chat_id, user_id):
+    if mongo is not None:
+        await local_auth_col.delete_one({"chat_id": chat_id, "user_id": user_id})
+    else:
+        sqlite_db.execute("DELETE FROM local_auth WHERE chat_id=? AND user_id=?", (chat_id,user_id))
+        sqlite_db.commit()
+
+
+async def local_auth_list(chat_id):
+    if mongo is not None:
+        return [x["user_id"] async for x in local_auth_col.find({"chat_id":chat_id}).sort("user_id",1)]
+    return [x[0] for x in sqlite_db.execute(
+        "SELECT user_id FROM local_auth WHERE chat_id=? ORDER BY user_id",(chat_id,)
+    ).fetchall()]
+
+
+async def global_auth_add(user_id):
+    if mongo is not None:
+        await global_auth_col.update_one(
+            {"user_id": user_id}, {"$set": {"user_id": user_id}}, upsert=True
+        )
+    else:
+        sqlite_db.execute("INSERT OR IGNORE INTO global_auth VALUES(?)",(user_id,))
+        sqlite_db.commit()
+
+
+async def global_auth_remove(user_id):
+    if mongo is not None:
+        await global_auth_col.delete_one({"user_id":user_id})
+    else:
+        sqlite_db.execute("DELETE FROM global_auth WHERE user_id=?",(user_id,))
+        sqlite_db.commit()
+
+
+async def global_auth_list():
+    if mongo is not None:
+        return [x["user_id"] async for x in global_auth_col.find({}).sort("user_id",1)]
+    return [x[0] for x in sqlite_db.execute(
+        "SELECT user_id FROM global_auth ORDER BY user_id"
+    ).fetchall()]
+
+
+async def is_global_auth(user_id):
+    if mongo is not None:
+        return bool(await global_auth_col.find_one({"user_id":user_id}))
+    return bool(sqlite_db.execute(
+        "SELECT 1 FROM global_auth WHERE user_id=?", (user_id,)
+    ).fetchone())
+
+
+async def is_admin(update, user_id=None):
+    if not update.effective_chat:
         return False
-    uid=user_id or update.effective_user.id
+    uid = user_id or (update.effective_user.id if update.effective_user else 0)
     try:
-        m=await update.effective_chat.get_member(uid)
-        return m.status in ("administrator","creator")
+        return (await update.effective_chat.get_member(uid)).status in ("administrator","creator")
     except Exception:
         return False
 
+
+async def can_manage(update, user_id=None):
+    uid = user_id or update.effective_user.id
+    return uid == OWNER_ID or await is_admin(update, uid) or await is_global_auth(uid)
+
+
 async def log_action(context, text):
     if LOG_CHAT:
-        try: await context.bot.send_message(LOG_CHAT, text)
-        except Exception: pass
+        try:
+            await context.bot.send_message(LOG_CHAT, text)
+        except Exception:
+            pass
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update, context):
     user = update.effective_user
     me = await context.bot.get_me()
-    mention = user.mention_html()
-
-    text = f"""
-• HELLO, {mention} 🇨🇦 ✨
+    text = f"""• HELLO, {user.mention_html()} 🇨🇦 ✨
 
 ✦ WELCOME TO <b>Shield Guard</b>
 <b>PREMIUM ABUSE & GROUP PROTECTION</b>
@@ -72,336 +256,425 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ╚════════════════════════════╝
 
 » ADD ME TO YOUR GROUP
-» GIVE ME DELETE MESSAGES
-  PERMISSION
+» GIVE ME DELETE MESSAGES PERMISSION
 
-• BUILT FOR A SAFER COMMUNITY.
-"""
-
-    keyboard = InlineKeyboardMarkup([
+• BUILT FOR A SAFER COMMUNITY."""
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✚ ADD ME IN YOUR GROUP ✚",
                               url=f"https://t.me/{me.username}?startgroup=true")],
-        [InlineKeyboardButton("💬 OWNER", url="https://t.me/YourOwnerUsername"),
-         InlineKeyboardButton("🧑‍💼 SUPPORT ↗", url="https://t.me/YourSupportUsername")],
-        [InlineKeyboardButton("📚 HELP AND COMMANDS", callback_data="help:1")]
+        [InlineKeyboardButton("💬 OWNER", url=f"https://t.me/{OWNER_USERNAME}"),
+         InlineKeyboardButton("🧑‍💼 SUPPORT ↗", url=f"https://t.me/{SUPPORT_USERNAME}")],
+        [InlineKeyboardButton("📚 HELP AND COMMANDS", callback_data="help_home")]
+    ])
+    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+HELP = {
+"help_link": "🔗 <b>LINK DEL</b>\n\n/antilink on|off\nDeletes detected links from non-admin users.",
+"help_admin": "🛡️ <b>ADMIN DETECT</b>\n\n/warn /warnings /unwarn /ban /unban USER_ID /kick /mute [minutes] /unmute /purge [count]",
+"help_broadcast": "📢 <b>BROADCAST</b>\n\n/broadcast MESSAGE\nOwner-only placeholder; mass messaging is disabled in this build.",
+"help_other": "⚙️ <b>OTHER</b>\n\n/start /help /settings /antispam on|off",
+"help_local_auth": "🔐 <b>LOCAL AUTH</b>\n\n/auth USER_ID\n/unauth USER_ID\n/authlist",
+"help_global_auth": "🌐 <b>GLOBAL AUTH</b>\n\n/gauth USER_ID\n/gunauth USER_ID\n/gauthlist",
+"help_edit_delete": "✏️ <b>EDIT DELETE</b>\n\n/editdelete on|off",
+"help_bio_link": "🔗 <b>BIO LINK</b>\n\n/biolink on|off",
+"help_media_del": "🧹 <b>MEDIA DEL</b>\n\n/mediadel on|off",
+"help_no_abuse": "🛡️ <b>NO ABUSE</b>\n\n/noabuse on|off",
+"help_nsfw": "🔞 <b>NSFW DEL</b>\n\n/nsfw on|off\nRequires SIGHTENGINE_USER and SIGHTENGINE_SECRET."
+}
+
+
+def help_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("LINK DEL", callback_data="help_link"),
+         InlineKeyboardButton("ADMIN DETECT", callback_data="help_admin")],
+        [InlineKeyboardButton("BROADCAST", callback_data="help_broadcast"),
+         InlineKeyboardButton("OTHER", callback_data="help_other")],
+        [InlineKeyboardButton("LOCAL AUTH", callback_data="help_local_auth"),
+         InlineKeyboardButton("GLOBAL AUTH", callback_data="help_global_auth")],
+        [InlineKeyboardButton("EDIT DELETE", callback_data="help_edit_delete"),
+         InlineKeyboardButton("BIO LINK", callback_data="help_bio_link")],
+        [InlineKeyboardButton("MEDIA DEL", callback_data="help_media_del"),
+         InlineKeyboardButton("NO ABUSE", callback_data="help_no_abuse")],
+        [InlineKeyboardButton("🔞 NSFW DEL", callback_data="help_nsfw")],
+        [InlineKeyboardButton("BACK ↩", callback_data="help_back"),
+         InlineKeyboardButton("• HOME •", callback_data="help_home"),
+         InlineKeyboardButton("NEXT", callback_data="help_next")]
     ])
 
-    try:
-        await update.message.reply_photo(
-            photo=os.getenv("START_IMAGE_URL", ""),
-            caption=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-    except Exception:
-        await update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-async def help_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update, context):
+    text = """📚 <b>HELP & COMMANDS ~</b>
+
+◇ <b>CHOOSE A CATEGORY BELOW TO VIEW ITS COMMANDS.</b>
+
+⚡ ADD ME IN YOUR GROUP AND GIVE ME <b>"DELETE MESSAGES"</b> PERMISSION.
+✨ KEEP YOUR GROUP CLEAN AND SAFE."""
+    if update.message:
+        await update.message.reply_text(text, reply_markup=help_keyboard(), parse_mode="HTML")
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=help_keyboard(), parse_mode="HTML")
+
+
+async def help_callback(update, context):
     q = update.callback_query
     await q.answer()
-    page = q.data.split(":")[1] if ":" in q.data else "1"
-
-    if page == "1":
-        text = """📖 <u><b>HELP & COMMANDS ~</b></u>
-
-◇ <b>CHOOSE A CATEGORY BELOW TO VIEW
-ITS COMMANDS.</b>
-
-⚡ <b>ADD ME IN YOUR GROUP AND GIVE
-ME "DELETE MESSAGES" PERMISSION.</b>
-✨ <b>KEEP YOUR GROUP CLEAN AND SAFE.</b>"""
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("LINK DEL", callback_data="help:link"),
-             InlineKeyboardButton("ADMIN DETECT", callback_data="help:admin")],
-            [InlineKeyboardButton("BROADCAST", callback_data="help:broadcast"),
-             InlineKeyboardButton("OTHER", callback_data="help:other")],
-            [InlineKeyboardButton("BACK ↩", callback_data="home"),
-             InlineKeyboardButton("• HOME •", callback_data="home")]
+    if q.data in HELP:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("BACK ↩",callback_data="help_back"),
+                                    InlineKeyboardButton("• HOME •",callback_data="help_home")]])
+        await q.edit_message_text(HELP[q.data], reply_markup=kb, parse_mode="HTML")
+    elif q.data == "help_home" or q.data == "help_back":
+        await help_cmd(update, context)
+    elif q.data == "help_next":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("LOCAL AUTH",callback_data="help_local_auth"),
+             InlineKeyboardButton("GLOBAL AUTH",callback_data="help_global_auth")],
+            [InlineKeyboardButton("EDIT DELETE",callback_data="help_edit_delete"),
+             InlineKeyboardButton("BIO LINK",callback_data="help_bio_link")],
+            [InlineKeyboardButton("MEDIA DEL",callback_data="help_media_del"),
+             InlineKeyboardButton("NO ABUSE",callback_data="help_no_abuse")],
+            [InlineKeyboardButton("🔞 NSFW DEL",callback_data="help_nsfw")],
+            [InlineKeyboardButton("BACK ↩",callback_data="help_back"),
+             InlineKeyboardButton("• HOME •",callback_data="help_home")]
         ])
-    elif page == "2":
-        text = """📖 <u><b>HELP & COMMANDS ~</b></u>
+        await q.edit_message_text("📚 <b>MORE COMMANDS</b>\n\nChoose a category:",
+                                  reply_markup=kb, parse_mode="HTML")
 
-◇ <b>CHOOSE A CATEGORY BELOW TO VIEW
-ITS COMMANDS.</b>"""
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("LOCAL AUTH", callback_data="help:local"),
-             InlineKeyboardButton("GLOBAL AUTH", callback_data="help:global")],
-            [InlineKeyboardButton("EDIT DELETE", callback_data="help:edit"),
-             InlineKeyboardButton("BIO LINK", callback_data="help:bio")],
-            [InlineKeyboardButton("MEDIA DEL", callback_data="help:media"),
-             InlineKeyboardButton("NO ABUSE", callback_data="help:noabuse")],
-            [InlineKeyboardButton("BACK ↩", callback_data="help:1"),
-             InlineKeyboardButton("• HOME •", callback_data="home"),
-             InlineKeyboardButton("NEXT", callback_data="help:3")]
-        ])
-    elif page == "3":
-        text = """📖 <u><b>HELP & COMMANDS ~</b></u>
-
-◇ <b>MODERATION COMMANDS</b>
-
-/warn — warn a member
-/warnings — check warnings
-/unwarn — reset warnings
-/ban — ban a member
-/unban USER_ID — unban
-/kick — kick a member
-/mute [minutes] — mute
-/unmute — unmute
-/purge [count] — delete messages
-/settings — view settings
-/antilink on|off — link protection
-/antispam on|off — flood protection"""
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("BACK ↩", callback_data="help:2"),
-             InlineKeyboardButton("• HOME •", callback_data="home")]
-        ])
-    else:
-        commands = {
-            "link": ("🔗 LINK DEL", "Automatically removes messages containing links.\n\n/antilink on\n/antilink off"),
-            "admin": ("🛡️ ADMIN DETECT", "Admin-only moderation controls.\n\nAdmins are protected from moderation actions."),
-            "broadcast": ("📢 BROADCAST", "Broadcast category reserved for bot-owner features."),
-            "other": ("⚙️ OTHER", "/settings\n/start\n/help"),
-            "local": ("🔐 LOCAL AUTH", "Group-level admin protection and moderation permissions."),
-            "global": ("🌐 GLOBAL AUTH", "Owner/global controls can be added here."),
-            "edit": ("✏️ EDIT DELETE", "Edited messages containing links are removed when anti-link is enabled."),
-            "bio": ("🔗 BIO LINK", "Link-protection category for profile/group link checks."),
-            "media": ("🧹 MEDIA DEL", "Media auto-delete category reserved for future media filters."),
-            "noabuse": ("🛡️ NO ABUSE", "Abuse/profanity protection category reserved for future filters.")
-        }
-        title, body = commands.get(page, ("HELP", "Choose a category."))
-        text = f"<u><b>{title}</b></u>\n\n{body}"
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("BACK ↩", callback_data="help:1" if page in ("link","admin","broadcast","other") else "help:2"),
-             InlineKeyboardButton("• HOME •", callback_data="home")]
-        ])
-
-    try:
-        await q.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="HTML")
-    except Exception:
-        await q.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query
-    if q.data=="home":
-        await q.answer()
-        user=q.from_user
-        me=await context.bot.get_me()
-        text=f"""• HELLO, {user.mention_html()} 🇨🇦 ✨
-
-✦ WELCOME TO <b>Shield Guard</b>
-<b>PREMIUM ABUSE & GROUP PROTECTION</b>
-
-⚡ <b>BLAZING FAST PROTECTION</b>
-🛡️ <b>AUTO ABUSE DETECTION</b>
-🔗 <b>BIO & LINK PROTECTION</b>
-🧹 <b>MEDIA AUTO-DELETE</b>
-⚙️ <b>SMART GROUP MODERATION</b>
-
-» ADD ME TO YOUR GROUP
-» GIVE ME DELETE MESSAGES PERMISSION"""
-        kb=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✚ ADD ME IN YOUR GROUP ✚",url=f"https://t.me/{me.username}?startgroup=true")],
-            [InlineKeyboardButton("💬 OWNER",url="https://t.me/YourOwnerUsername"),
-             InlineKeyboardButton("🧑‍💼 SUPPORT ↗",url="https://t.me/YourSupportUsername")],
-            [InlineKeyboardButton("📚 HELP AND COMMANDS",callback_data="help:1")]
-        ])
-        try: await q.edit_message_caption(caption=text,reply_markup=kb,parse_mode="HTML")
-        except Exception: await q.edit_message_text(text=text,reply_markup=kb,parse_mode="HTML")
-    elif q.data.startswith("help:"):
-        await help_menu(update,context)
-
-async def settings_cmd(update, context):
-    if not await admin(update): return
-    s=settings(update.effective_chat.id)
-    await update.message.reply_text(
-        f"⚙️ Settings\n\n"
-        f"🔗 Anti-link: {'ON' if s[0] else 'OFF'}\n"
-        f"🌊 Anti-flood: {'ON' if s[1] else 'OFF'}\n"
-        f"👋 Welcome: {'ON' if s[2] else 'OFF'}\n"
-        f"⚠️ Max warnings: {s[3]}"
-    )
 
 async def toggle(update, context, field, name):
-    if not await admin(update): return
+    if not await can_manage(update):
+        return
     if not context.args or context.args[0].lower() not in ("on","off"):
-        await update.message.reply_text(f"Usage: /{name} on|off"); return
-    val=1 if context.args[0].lower()=="on" else 0
-    db.execute(f"UPDATE settings SET {field}=? WHERE chat_id=?", (val,update.effective_chat.id))
-    db.commit()
-    await update.message.reply_text(f"✅ {name.title()} {'enabled' if val else 'disabled'}.")
+        await update.message.reply_text(f"Usage: /{name} on|off")
+        return
+    value = 1 if context.args[0].lower() == "on" else 0
+    await set_setting(update.effective_chat.id, field, value)
+    await update.message.reply_text(f"✅ {name.title()} {'enabled' if value else 'disabled'}.")
 
-async def antilink(update, context): await toggle(update,context,"links","antilink")
-async def antispam(update, context): await toggle(update,context,"flood","antispam")
 
-async def target(update):
-    if update.message.reply_to_message:
+async def settings_cmd(update, context):
+    if not await can_manage(update):
+        return
+    s = await get_settings(update.effective_chat.id)
+    await update.message.reply_text(
+        f"⚙️ <b>SETTINGS</b>\n\n"
+        f"🔗 Anti-link: {'ON' if s[0] else 'OFF'}\n"
+        f"🌊 Anti-flood: {'ON' if s[1] else 'OFF'}\n"
+        f"✏️ Edit-delete: {'ON' if s[4] else 'OFF'}\n"
+        f"🔗 Bio-link: {'ON' if s[5] else 'OFF'}\n"
+        f"🧹 Media-delete: {'ON' if s[6] else 'OFF'}\n"
+        f"🛡️ No-abuse: {'ON' if s[7] else 'OFF'}\n"
+        f"🔞 NSFW-delete: {'ON' if s[8] else 'OFF'}\n"
+        f"⚠️ Max warnings: {s[3]}",
+        parse_mode="HTML"
+    )
+
+
+async def get_target(update):
+    if update.message and update.message.reply_to_message:
         return update.message.reply_to_message.from_user
-    if update.message.entities:
-        for e in update.message.entities:
-            if e.type=="text_mention":
-                return e.user
     return None
 
+
 async def warn(update, context):
-    if not await admin(update): return
-    u=await target(update)
-    if not u:
-        await update.message.reply_text("Reply to a user's message and use /warn."); return
-    if await admin(update,u.id):
-        await update.message.reply_text("❌ I won't warn an admin."); return
-    row=db.execute("SELECT count FROM warns WHERE chat_id=? AND user_id=?",(update.effective_chat.id,u.id)).fetchone()
-    count=(row[0] if row else 0)+1
-    db.execute("INSERT OR REPLACE INTO warns VALUES(?,?,?)",(update.effective_chat.id,u.id,count)); db.commit()
-    maxw=settings(update.effective_chat.id)[3]
-    await update.message.reply_text(f"⚠️ {u.mention_html()} warned. ({count}/{maxw})", parse_mode="HTML")
-    if count>=maxw:
+    if not await can_manage(update): return
+    u = await get_target(update)
+    if not u: return await update.message.reply_text("Reply to a user's message.")
+    if await is_admin(update,u.id): return await update.message.reply_text("❌ Admin cannot be warned.")
+    count = await get_warn_count(update.effective_chat.id,u.id) + 1
+    await set_warn_count(update.effective_chat.id,u.id,count)
+    maxw = (await get_settings(update.effective_chat.id))[3]
+    await update.message.reply_text(f"⚠️ {u.mention_html()} warned. ({count}/{maxw})",parse_mode="HTML")
+    if count >= maxw:
         try:
             await update.effective_chat.ban_member(u.id)
-            db.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?",(update.effective_chat.id,u.id)); db.commit()
-            await log_action(context,f"🚫 Auto-ban: {u.full_name} ({u.id}) reached {maxw} warnings.")
-        except Exception as e: log.warning(e)
+            await set_warn_count(update.effective_chat.id,u.id,0)
+        except Exception as e:
+            log.warning(e)
+
 
 async def warnings(update, context):
-    u=await target(update)
-    if not u: u=update.effective_user
-    row=db.execute("SELECT count FROM warns WHERE chat_id=? AND user_id=?",(update.effective_chat.id,u.id)).fetchone()
-    await update.message.reply_text(f"⚠️ {u.full_name}: {row[0] if row else 0} warning(s).")
+    u = await get_target(update) or update.effective_user
+    count = await get_warn_count(update.effective_chat.id,u.id)
+    await update.message.reply_text(f"⚠️ {u.full_name}: {count} warning(s).")
+
 
 async def unwarn(update, context):
-    if not await admin(update): return
-    u=await target(update)
-    if not u: await update.message.reply_text("Reply to a user's message."); return
-    db.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?",(update.effective_chat.id,u.id)); db.commit()
-    await update.message.reply_text(f"✅ Warnings reset for {u.mention_html()}.", parse_mode="HTML")
+    if not await can_manage(update): return
+    u = await get_target(update)
+    if not u: return await update.message.reply_text("Reply to a user's message.")
+    await set_warn_count(update.effective_chat.id,u.id,0)
+    await update.message.reply_text("✅ Warnings reset.")
+
 
 async def ban(update, context):
-    if not await admin(update): return
-    u=await target(update)
-    if not u: await update.message.reply_text("Reply to a user's message."); return
-    if await admin(update,u.id): return
+    if not await can_manage(update): return
+    u = await get_target(update)
+    if not u: return await update.message.reply_text("Reply to a user's message.")
+    if await is_admin(update,u.id): return
     try:
         await update.effective_chat.ban_member(u.id)
-        await update.message.reply_text(f"🚫 Banned {u.mention_html()}.", parse_mode="HTML")
-        await log_action(context,f"🚫 BAN | {u.full_name} | {u.id} | chat {update.effective_chat.id}")
-    except Exception as e: await update.message.reply_text(f"❌ Ban failed: {e}")
+        await update.message.reply_text(f"🚫 Banned {u.mention_html()}.",parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
 
 async def unban(update, context):
-    if not await admin(update): return
-    if not context.args:
-        await update.message.reply_text("Usage: /unban USER_ID"); return
+    if not await can_manage(update): return
+    if not context.args: return await update.message.reply_text("Usage: /unban USER_ID")
     try:
         await update.effective_chat.unban_member(int(context.args[0]))
         await update.message.reply_text("✅ User unbanned.")
-    except Exception as e: await update.message.reply_text(f"❌ {e}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
 
 async def kick(update, context):
-    if not await admin(update): return
-    u=await target(update)
-    if not u: await update.message.reply_text("Reply to a user's message."); return
-    if await admin(update,u.id): return
+    if not await can_manage(update): return
+    u = await get_target(update)
+    if not u: return await update.message.reply_text("Reply to a user's message.")
+    if await is_admin(update,u.id): return
     try:
         await update.effective_chat.ban_member(u.id)
         await update.effective_chat.unban_member(u.id)
-        await update.message.reply_text(f"👢 Kicked {u.mention_html()}.", parse_mode="HTML")
-    except Exception as e: await update.message.reply_text(f"❌ {e}")
+        await update.message.reply_text("👢 Kicked.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
 
 async def mute(update, context):
-    if not await admin(update): return
-    u=await target(update)
-    if not u: await update.message.reply_text("Reply to a user's message."); return
-    if await admin(update,u.id): return
-    minutes=10
+    if not await can_manage(update): return
+    u = await get_target(update)
+    if not u: return await update.message.reply_text("Reply to a user's message.")
+    minutes = 10
     if context.args:
-        try: minutes=max(1,min(int(context.args[0]),10080))
-        except: pass
-    until=int(time.time())+minutes*60
+        try: minutes = max(1,min(int(context.args[0]),10080))
+        except ValueError: pass
     try:
-        await update.effective_chat.restrict_member(u.id, ChatPermissions(can_send_messages=False), until_date=until)
-        await update.message.reply_text(f"🔇 Muted {u.mention_html()} for {minutes} min.", parse_mode="HTML")
-    except Exception as e: await update.message.reply_text(f"❌ {e}")
+        await update.effective_chat.restrict_member(
+            u.id, ChatPermissions(can_send_messages=False),
+            until_date=int(time.time())+minutes*60
+        )
+        await update.message.reply_text(f"🔇 Muted for {minutes} minutes.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
 
 async def unmute(update, context):
-    if not await admin(update): return
-    u=await target(update)
-    if not u: await update.message.reply_text("Reply to a user's message."); return
+    if not await can_manage(update): return
+    u = await get_target(update)
+    if not u: return await update.message.reply_text("Reply to a user's message.")
     try:
-        await update.effective_chat.restrict_member(u.id, ChatPermissions(can_send_messages=True,can_send_other_messages=True))
+        await update.effective_chat.restrict_member(
+            u.id, ChatPermissions(can_send_messages=True,can_send_other_messages=True)
+        )
         await update.message.reply_text("🔊 Unmuted.")
-    except Exception as e: await update.message.reply_text(f"❌ {e}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
 
 async def purge(update, context):
-    if not await admin(update): return
-    count=10
+    if not await can_manage(update): return
+    count = 10
     if context.args:
         try: count=max(1,min(int(context.args[0]),100))
-        except: pass
+        except ValueError: pass
     deleted=0
-    msg=update.message
     for i in range(count):
         try:
-            await context.bot.delete_message(update.effective_chat.id, msg.message_id-i)
+            await context.bot.delete_message(update.effective_chat.id,update.message.message_id-i)
             deleted+=1
         except Exception: pass
-    await update.message.reply_text(f"🧹 Deleted {deleted} messages.", quote=True)
+    await update.message.reply_text(f"🧹 Deleted {deleted} messages.")
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def auth(update, context):
+    if not await is_admin(update): return
+    uid = int(context.args[0]) if context.args and context.args[0].isdigit() else (
+        update.message.reply_to_message.from_user.id if update.message.reply_to_message else 0)
+    if not uid: return await update.message.reply_text("Usage: /auth USER_ID or reply.")
+    await local_auth_add(update.effective_chat.id,uid)
+    await update.message.reply_text(f"✅ Local auth added: {uid}")
+
+
+async def unauth(update, context):
+    if not await is_admin(update): return
+    uid = int(context.args[0]) if context.args and context.args[0].isdigit() else (
+        update.message.reply_to_message.from_user.id if update.message.reply_to_message else 0)
+    if not uid: return await update.message.reply_text("Usage: /unauth USER_ID or reply.")
+    await local_auth_remove(update.effective_chat.id,uid)
+    await update.message.reply_text("✅ Local auth removed.")
+
+
+async def authlist(update, context):
+    if not await can_manage(update): return
+    ids = await local_auth_list(update.effective_chat.id)
+    await update.message.reply_text("🔐 LOCAL AUTH\n\n" + ("\n".join(map(str,ids)) if ids else "None"))
+
+
+async def gauth(update, context):
+    if update.effective_user.id != OWNER_ID: return await update.message.reply_text("❌ Owner only.")
+    uid = int(context.args[0]) if context.args and context.args[0].isdigit() else (
+        update.message.reply_to_message.from_user.id if update.message.reply_to_message else 0)
+    if not uid: return await update.message.reply_text("Usage: /gauth USER_ID")
+    await global_auth_add(uid)
+    await update.message.reply_text("🌐 Global auth added.")
+
+
+async def gunauth(update, context):
+    if update.effective_user.id != OWNER_ID: return await update.message.reply_text("❌ Owner only.")
+    if not context.args or not context.args[0].isdigit(): return await update.message.reply_text("Usage: /gunauth USER_ID")
+    await global_auth_remove(int(context.args[0]))
+    await update.message.reply_text("🌐 Global auth removed.")
+
+
+async def gauthlist(update, context):
+    if update.effective_user.id != OWNER_ID: return await update.message.reply_text("❌ Owner only.")
+    ids=await global_auth_list()
+    await update.message.reply_text("🌐 GLOBAL AUTH\n\n" + ("\n".join(map(str,ids)) if ids else "None"))
+
+
+async def broadcast(update, context):
+    if update.effective_user.id != OWNER_ID: return await update.message.reply_text("❌ Owner only.")
+    await update.message.reply_text("📢 Broadcast is disabled in this build.")
+
+
+async def check_nsfw(media_bytes, filename):
+    if not SIGHTENGINE_USER or not SIGHTENGINE_SECRET:
+        return False
+    def run():
+        try:
+            r=requests.post(
+                "https://api.sightengine.com/1.0/check.json",
+                params={"models":"nudity-2.1","api_user":SIGHTENGINE_USER,"api_secret":SIGHTENGINE_SECRET},
+                files={"media":(filename,media_bytes)}, timeout=30)
+            r.raise_for_status()
+            n=r.json().get("nudity",{})
+            return max(float(n.get("raw",0) or 0),float(n.get("sexual_activity",0) or 0),
+                       float(n.get("sexual_display",0) or 0),float(n.get("erotica",0) or 0)) >= NSFW_THRESHOLD
+        except Exception as e:
+            log.warning("NSFW API error: %s",e)
+            return False
+    return await asyncio.to_thread(run)
+
+
+async def check_nsfw_media(update, context):
+    m=update.effective_message
+    if not m or not (m.photo or m.video or m.animation): return False
+    try:
+        if m.photo:
+            f=await context.bot.get_file(m.photo[-1].file_id); name="photo.jpg"
+        elif m.video:
+            f=await context.bot.get_file(m.video.file_id); name="video.mp4"
+        else:
+            f=await context.bot.get_file(m.animation.file_id); name="animation.mp4"
+        buf=io.BytesIO()
+        await f.download_to_memory(out=buf)
+        if await check_nsfw(buf.getvalue(),name):
+            await m.delete()
+            return True
+    except Exception as e:
+        log.warning("NSFW check failed: %s",e)
+    return False
+
+
+async def on_message(update, context):
     m=update.effective_message
     if not m or not update.effective_chat or not update.effective_user: return
-    if await admin(update): return
-    links,flood,_,_=settings(update.effective_chat.id)
+    if await can_manage(update,m.from_user.id): return
+    s=await get_settings(m.chat.id)
 
-    if links and (m.text or m.caption) and LINK_RE.search(m.text or m.caption):
-        try:
-            await m.delete()
-            await log_action(context,f"🔗 Deleted link from {update.effective_user.full_name} ({update.effective_user.id})")
+    if s[8] and await check_nsfw_media(update,context): return
+
+    if s[0] and (m.text or m.caption) and LINK_RE.search(m.text or m.caption):
+        try: await m.delete()
         except Exception: pass
         return
 
-    if flood:
+    if s[6] and (m.photo or m.video or m.animation or m.document or m.audio or m.voice):
+        try: await m.delete()
+        except Exception: pass
+        return
+
+    if s[7] and (m.text or m.caption):
+        words=set(re.findall(r"[a-z0-9\u0900-\u097f]+",(m.text or m.caption).lower()))
+        if words & ABUSE_WORDS:
+            try: await m.delete()
+            except Exception: pass
+            return
+
+    if s[1]:
         now=time.monotonic()
-        q=flood_cache[update.effective_chat.id][update.effective_user.id]
+        q=flood_cache[m.chat.id][m.from_user.id]
         q.append(now)
         while q and now-q[0]>8: q.popleft()
         if len(q)>=6:
             try:
                 await m.delete()
-                await update.effective_chat.restrict_member(
-                    update.effective_user.id,
-                    ChatPermissions(can_send_messages=False),
-                    until_date=int(time.time())+60
-                )
+                await m.chat.restrict_member(m.from_user.id,ChatPermissions(can_send_messages=False),
+                                              until_date=int(time.time())+60)
                 q.clear()
-                await log_action(context,f"🌊 Flood mute: {update.effective_user.full_name} ({update.effective_user.id})")
             except Exception: pass
+
+
+async def edited_message(update, context):
+    m=update.edited_message
+    if not m or not m.from_user: return
+    if await can_manage(update,m.from_user.id): return
+    s=await get_settings(m.chat.id)
+    if s[4]:
+        try: await m.delete()
+        except Exception: pass
+
 
 async def error_handler(update, context):
     log.exception("Update error", exc_info=context.error)
 
+
 def main():
     if not TOKEN:
-        raise SystemExit("BOT_TOKEN is missing. Put your bot token in .env.")
+        raise SystemExit("BOT_TOKEN is missing. Set it in Heroku Config Vars.")
+
     app=Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("help",help_cmd))
     app.add_handler(CommandHandler("settings",settings_cmd))
-    app.add_handler(CommandHandler("antilink",antilink))
-    app.add_handler(CommandHandler("antispam",antispam))
-    app.add_handler(CommandHandler("warn",warn))
-    app.add_handler(CommandHandler("warnings",warnings))
-    app.add_handler(CommandHandler("unwarn",unwarn))
-    app.add_handler(CommandHandler("ban",ban))
-    app.add_handler(CommandHandler("unban",unban))
-    app.add_handler(CommandHandler("kick",kick))
-    app.add_handler(CommandHandler("mute",mute))
-    app.add_handler(CommandHandler("unmute",unmute))
-    app.add_handler(CommandHandler("purge",purge))
-    app.add_handler(CallbackQueryHandler(callbacks, pattern=r"^(help:|home)"))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+
+    for cmd,func in [
+        ("antilink",lambda u,c: toggle(u,c,"links","antilink")),
+        ("antispam",lambda u,c: toggle(u,c,"flood","antispam")),
+        ("editdelete",lambda u,c: toggle(u,c,"edit_delete","editdelete")),
+        ("biolink",lambda u,c: toggle(u,c,"bio_link","biolink")),
+        ("mediadel",lambda u,c: toggle(u,c,"media_del","mediadel")),
+        ("noabuse",lambda u,c: toggle(u,c,"no_abuse","noabuse")),
+        ("nsfw",lambda u,c: toggle(u,c,"nsfw","nsfw")),
+    ]:
+        app.add_handler(CommandHandler(cmd,func))
+
+    for cmd,func in [
+        ("warn",warn),("warnings",warnings),("unwarn",unwarn),("ban",ban),
+        ("unban",unban),("kick",kick),("mute",mute),("unmute",unmute),("purge",purge),
+        ("auth",auth),("unauth",unauth),("authlist",authlist),
+        ("gauth",gauth),("gunauth",gunauth),("gauthlist",gauthlist),
+        ("broadcast",broadcast)
+    ]:
+        app.add_handler(CommandHandler(cmd,func))
+
+    app.add_handler(CallbackQueryHandler(help_callback,pattern=r"^help_"))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE,edited_message))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,on_message))
     app.add_error_handler(error_handler)
+
+    async def post_init(application):
+        await init_db()
+    async def post_shutdown(application):
+        await close_db()
+    app.post_init=post_init
+    app.post_shutdown=post_shutdown
+
     log.info("Shield Guard started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__=="__main__":
     main()
