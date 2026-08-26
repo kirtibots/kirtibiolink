@@ -23,12 +23,14 @@ from telegram.ext import (
 )
 
 # =========================================================
-# 🛡️ SHIELD GUARD
+# 🛡️ SHIELD GUARD BOT
 # =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+OWNER_ID = int(
+    os.getenv("OWNER_ID", "0") or 0
+)
 
 OWNER_USERNAME = os.getenv(
     "OWNER_USERNAME",
@@ -51,6 +53,22 @@ DB_PATH = os.getenv(
 ).strip()
 
 # =========================================================
+# 🖼️ HELP IMAGE
+# =========================================================
+# Telegram file_id ya direct image URL.
+#
+# Example:
+# HELP_IMAGE=AgACAgUAA...
+#
+# Agar empty chhoda to image ke bina help message aayega.
+# =========================================================
+
+HELP_IMAGE = os.getenv(
+    "HELP_IMAGE",
+    ""
+).strip()
+
+# =========================================================
 # LOGGING
 # =========================================================
 
@@ -59,7 +77,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-log = logging.getLogger("shield_guard")
+log = logging.getLogger(
+    "shield_guard"
+)
 
 # =========================================================
 # DATABASE
@@ -75,7 +95,11 @@ CREATE TABLE IF NOT EXISTS settings (
     chat_id INTEGER PRIMARY KEY,
     links INTEGER DEFAULT 1,
     flood INTEGER DEFAULT 1,
-    max_warns INTEGER DEFAULT 3
+    max_warns INTEGER DEFAULT 3,
+    edit_delete INTEGER DEFAULT 0,
+    bio_link INTEGER DEFAULT 0,
+    media_delete INTEGER DEFAULT 0,
+    abuse INTEGER DEFAULT 1
 )
 """)
 
@@ -105,6 +129,25 @@ CREATE TABLE IF NOT EXISTS global_auth (
 db.commit()
 
 # =========================================================
+# OLD DATABASE MIGRATION
+# =========================================================
+
+for column, definition in [
+    ("edit_delete", "INTEGER DEFAULT 0"),
+    ("bio_link", "INTEGER DEFAULT 0"),
+    ("media_delete", "INTEGER DEFAULT 0"),
+    ("abuse", "INTEGER DEFAULT 1"),
+]:
+    try:
+        db.execute(
+            f"ALTER TABLE settings ADD COLUMN "
+            f"{column} {definition}"
+        )
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
+
+# =========================================================
 # DEFAULT SETTINGS
 # =========================================================
 
@@ -112,16 +155,38 @@ DEFAULT_SETTINGS = {
     "links": 1,
     "flood": 1,
     "max_warns": 3,
+    "edit_delete": 0,
+    "bio_link": 0,
+    "media_delete": 0,
+    "abuse": 1,
 }
 
 # =========================================================
-# REGEX / CACHE
+# REGEX
 # =========================================================
 
 LINK_RE = re.compile(
     r"(https?://|www\.|t\.me/|telegram\.me/)",
     re.IGNORECASE
 )
+
+BIO_LINK_RE = re.compile(
+    r"(https?://|www\.|t\.me/|telegram\.me/)",
+    re.IGNORECASE
+)
+
+# Basic abuse filter
+ABUSE_WORDS = {
+    "fuck",
+    "fucking",
+    "bitch",
+    "bastard",
+    "asshole",
+}
+
+# =========================================================
+# FLOOD CACHE
+# =========================================================
 
 flood_cache = defaultdict(
     lambda: defaultdict(deque)
@@ -136,7 +201,14 @@ async def get_settings(chat_id: int):
 
     row = db.execute(
         """
-        SELECT links, flood, max_warns
+        SELECT
+            links,
+            flood,
+            max_warns,
+            edit_delete,
+            bio_link,
+            media_delete,
+            abuse
         FROM settings
         WHERE chat_id=?
         """,
@@ -149,23 +221,40 @@ async def get_settings(chat_id: int):
     db.execute(
         """
         INSERT OR IGNORE INTO settings
-        (chat_id, links, flood, max_warns)
-        VALUES (?, ?, ?, ?)
+        (
+            chat_id,
+            links,
+            flood,
+            max_warns,
+            edit_delete,
+            bio_link,
+            media_delete,
+            abuse
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             chat_id,
-            DEFAULT_SETTINGS["links"],
-            DEFAULT_SETTINGS["flood"],
-            DEFAULT_SETTINGS["max_warns"],
+            1,
+            1,
+            3,
+            0,
+            0,
+            0,
+            1,
         )
     )
 
     db.commit()
 
     return (
-        DEFAULT_SETTINGS["links"],
-        DEFAULT_SETTINGS["flood"],
-        DEFAULT_SETTINGS["max_warns"],
+        1,
+        1,
+        3,
+        0,
+        0,
+        0,
+        1,
     )
 
 
@@ -212,7 +301,9 @@ async def get_warn_count(
         )
     ).fetchone()
 
-    return int(row[0]) if row else 0
+    return int(
+        row[0]
+    ) if row else 0
 
 
 async def set_warn_count(
@@ -276,7 +367,9 @@ async def is_local_auth(
     return bool(row)
 
 
-async def is_global_auth(user_id: int):
+async def is_global_auth(
+    user_id: int
+):
 
     if user_id == OWNER_ID:
         return True
@@ -332,7 +425,9 @@ async def remove_local_auth(
     db.commit()
 
 
-async def add_global_auth(user_id: int):
+async def add_global_auth(
+    user_id: int
+):
 
     db.execute(
         """
@@ -346,7 +441,9 @@ async def add_global_auth(user_id: int):
     db.commit()
 
 
-async def remove_global_auth(user_id: int):
+async def remove_global_auth(
+    user_id: int
+):
 
     db.execute(
         """
@@ -384,7 +481,9 @@ async def is_admin(
 
     try:
 
-        member = await chat.get_member(uid)
+        member = await chat.get_member(
+            uid
+        )
 
         return member.status in (
             "administrator",
@@ -421,7 +520,6 @@ async def can_manage(
         uid
     )
 
-
 # =========================================================
 # LOGGING
 # =========================================================
@@ -447,6 +545,358 @@ async def log_action(
         pass
 
 # =========================================================
+# HELP HOME
+# =========================================================
+
+
+HELP_HOME = """
+📖 <b>Hᴇʟᴘ & Cᴏᴍᴍᴀɴᴅs ~</b>
+
+◇ <b>Cʜᴏᴏsᴇ A Cᴀᴛᴇɢᴏʀʏ Bᴇʟᴏᴡ Tᴏ Vɪᴇᴡ
+Iᴛs Cᴏᴍᴍᴀɴᴅs.</b>
+
+⚡ <b>Aᴅᴅ Mᴇ Iɴ Yᴏᴜʀ Gʀᴏᴜᴘ Aɴᴅ Gɪᴠᴇ
+Mᴇ "Dᴇʟᴇᴛᴇ Mᴇssᴀɢᴇs" Pᴇʀᴍɪssɪᴏɴ.</b>
+
+✨ <b>Kᴇᴇᴘ Yᴏᴜʀ Gʀᴏᴜᴘ Cʟᴇᴀɴ Aɴᴅ Sᴀғᴇ.</b>
+"""
+
+# =========================================================
+# HELP PAGES
+# =========================================================
+
+
+HELP_PAGES = {
+
+    0: HELP_HOME,
+
+    1: """
+🔐 <b>Lᴏᴄᴀʟ Aᴜᴛʜ</b>
+
+🔐 /auth
+Rᴇᴘʟʏ Tᴏ A Uѕᴇʀ Tᴏ Aᴜᴛʜᴏʀɪᴢᴇ.
+
+🔓 /unauth
+Rᴇᴍᴏᴠᴇ Lᴏᴄᴀʟ Aᴜᴛʜ.
+
+📋 /authlist
+Sʜᴏᴡ Lᴏᴄᴀʟ Aᴜᴛʜ Uѕᴇʀѕ.
+
+✦ Aᴜᴛʜ Uѕᴇʀѕ Aʀᴇ Eᴍᴘᴛ Fʀᴏᴍ
+Aɴᴛɪ-Lɪɴᴋ & Aɴᴛɪ-Sᴘᴀᴍ.
+""",
+
+    2: """
+🌐 <b>Gʟᴏʙᴀʟ Aᴜᴛʜ</b>
+
+🌐 /gauth
+Aᴅᴅ Gʟᴏʙᴀʟ Aᴜᴛʜ.
+
+🔓 /gunauth
+Rᴇᴍᴏᴠᴇ Gʟᴏʙᴀʟ Aᴜᴛʜ.
+
+👑 Oɴʟʏ Bᴏᴛ Oᴡɴᴇʀ
+Cᴀɴ Mᴀɴᴀɢᴇ Gʟᴏʙᴀʟ Aᴜᴛʜ.
+""",
+
+    3: """
+📝 <b>Eᴅɪᴛ Dᴇʟᴇᴛᴇ</b>
+
+⚡ /editdelete on
+Eɴᴀʙʟᴇ Eᴅɪᴛ Dᴇʟᴇᴛᴇ.
+
+⚡ /editdelete off
+Dɪѕᴀʙʟᴇ Eᴅɪᴛ Dᴇʟᴇᴛᴇ.
+
+✦ Dᴇʟᴇᴛᴇs Mᴇssᴀɢᴇs
+Wʜᴇɴ A Uѕᴇʀ Eᴅɪᴛѕ A Mᴇssᴀɢᴇ.
+""",
+
+    4: """
+🔗 <b>Bɪᴏ Lɪɴᴋ</b>
+
+🔗 /biolink on
+Eɴᴀʙʟᴇ Bɪᴏ Lɪɴᴋ Fɪʟᴛᴇʀ.
+
+🔗 /biolink off
+Dɪѕᴀʙʟᴇ Bɪᴏ Lɪɴᴋ Fɪʟᴛᴇʀ.
+
+✦ Kᴇᴇᴘ Yᴏᴜʀ Gʀᴏᴜᴘ Cʟᴇᴀɴ
+Fʀᴏᴍ Uɴᴡᴀɴᴛᴇᴅ Lɪɴᴋѕ.
+""",
+
+    5: """
+🎬 <b>Mᴇᴅɪᴀ Dᴇʟ</b>
+
+🎬 /mediadel on
+Eɴᴀʙʟᴇ Mᴇᴅɪᴀ Dᴇʟᴇᴛᴇ.
+
+🎬 /mediadel off
+Dɪѕᴀʙʟᴇ Mᴇᴅɪᴀ Dᴇʟᴇᴛᴇ.
+
+🗑️ /purge 20
+Dᴇʟᴇᴛᴇ Rᴇᴄᴇɴᴛ Mᴇssᴀɢᴇs.
+""",
+
+    6: """
+🚫 <b>Nᴏ Aʙᴜsᴇ</b>
+
+🚫 /abuse on
+Eɴᴀʙʟᴇ Aʙᴜѕᴇ Fɪʟᴛᴇʀ.
+
+🚫 /abuse off
+Dɪѕᴀʙʟᴇ Aʙᴜѕᴇ Fɪʟᴛᴇʀ.
+
+⚠️ /warn
+Wᴀʀɴ A Uѕᴇʀ.
+
+📊 /warnings
+Cʜᴇᴄᴋ Wᴀʀɴɪɴɢs.
+
+♻️ /unwarn
+Rᴇѕᴇᴛ Wᴀʀɴɪɴɢs.
+""",
+
+    7: """
+🔗 <b>Lɪɴᴋ Fɪʟᴛᴇʀ</b>
+
+🔗 /antilink on
+Eɴᴀʙʟᴇ Aɴᴛɪ-Lɪɴᴋ.
+
+🔗 /antilink off
+Dɪѕᴀʙʟᴇ Aɴᴛɪ-Lɪɴᴋ.
+
+🌊 /antispam on
+Eɴᴀʙʟᴇ Aɴᴛɪ-Sᴘᴀᴍ.
+
+🌊 /antispam off
+Dɪѕᴀʙʟᴇ Aɴᴛɪ-Sᴘᴀᴍ.
+""",
+
+    8: """
+🛡️ <b>Aᴅᴍɪɴ Cᴏᴍᴍᴀɴᴅs</b>
+
+🚫 /ban
+Bᴀɴ A Rᴇᴘʟɪᴇᴅ Uѕᴇʀ.
+
+🔓 /unban USER_ID
+Uɴʙᴀɴ Uѕᴇʀ.
+
+👢 /kick
+Kɪᴄᴋ A Rᴇᴘʟɪᴇᴅ Uѕᴇʀ.
+
+🔇 /mute [minutes]
+Mᴜᴛᴇ Uѕᴇʀ.
+
+🔊 /unmute
+Uɴᴍᴜᴛᴇ Uѕᴇʀ.
+
+🗑️ /purge [count]
+Dᴇʟᴇᴛᴇ Mᴇssᴀɢᴇs.
+""",
+
+    9: """
+⚙️ <b>Oᴛʜᴇʀ Cᴏᴍᴍᴀɴᴅs</b>
+
+/start
+/hᴇlp
+/settings
+
+⚡ /antilink on|off
+⚡ /antispam on|off
+⚡ /editdelete on|off
+⚡ /biolink on|off
+⚡ /mediadel on|off
+⚡ /abuse on|off
+"""
+}
+
+# =========================================================
+# HELP BUTTONS
+# =========================================================
+
+
+def help_keyboard(
+    page=0
+):
+
+    if page == 0:
+
+        return InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "Lᴏᴄᴀʟ Aᴜᴛʜ",
+                    callback_data="help_page_1"
+                ),
+
+                InlineKeyboardButton(
+                    "Gʟᴏʙᴀʟ Aᴜᴛʜ",
+                    callback_data="help_page_2"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "Eᴅɪᴛ Dᴇʟᴇᴛᴇ",
+                    callback_data="help_page_3"
+                ),
+
+                InlineKeyboardButton(
+                    "Bɪᴏ Lɪɴᴋ",
+                    callback_data="help_page_4"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "Mᴇᴅɪᴀ Dᴇʟ",
+                    callback_data="help_page_5"
+                ),
+
+                InlineKeyboardButton(
+                    "Nᴏ Aʙᴜsᴇ",
+                    callback_data="help_page_6"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "Bᴀᴄᴋ ↩",
+                    callback_data="help_page_0"
+                ),
+
+                InlineKeyboardButton(
+                    "• Hᴏᴍᴇ •",
+                    callback_data="help_page_0"
+                ),
+
+                InlineKeyboardButton(
+                    "Nᴇxᴛ",
+                    callback_data="help_page_1"
+                )
+            ]
+        ])
+
+    previous_page = page - 1
+
+    if previous_page < 0:
+        previous_page = 0
+
+    next_page = page + 1
+
+    if next_page > 9:
+        next_page = 0
+
+    return InlineKeyboardMarkup([
+
+        [
+            InlineKeyboardButton(
+                "Bᴀᴄᴋ ↩",
+                callback_data=f"help_page_{previous_page}"
+            ),
+
+            InlineKeyboardButton(
+                "• Hᴏᴍᴇ •",
+                callback_data="help_page_0"
+            ),
+
+            InlineKeyboardButton(
+                "Nᴇxᴛ",
+                callback_data=f"help_page_{next_page}"
+            )
+        ]
+    ])
+
+# =========================================================
+# SEND HELP
+# =========================================================
+
+
+async def send_help(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    page=0
+):
+
+    text = HELP_PAGES.get(
+        page,
+        HELP_HOME
+    )
+
+    keyboard = help_keyboard(
+        page
+    )
+
+    # -----------------------------------------------------
+    # NORMAL MESSAGE
+    # -----------------------------------------------------
+
+    if update.message:
+
+        if HELP_IMAGE:
+
+            try:
+
+                await update.message.reply_photo(
+                    photo=HELP_IMAGE,
+                    caption=text,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML
+                )
+
+                return
+
+            except Exception as e:
+
+                log.warning(
+                    "HELP_IMAGE failed: %s",
+                    e
+                )
+
+        await update.message.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # CALLBACK MESSAGE
+    # -----------------------------------------------------
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    try:
+
+        await query.edit_message_caption(
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+
+    except Exception:
+
+        try:
+
+            await query.edit_message_text(
+                text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML
+            )
+
+        except Exception as e:
+
+            log.warning(
+                "Help edit failed: %s",
+                e
+            )
+
+# =========================================================
 # START
 # =========================================================
 
@@ -456,307 +906,16 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.message:
-        return
+    # /start = EXACT HELP MENU
 
-    user = update.effective_user
-
-    try:
-
-        me = await context.bot.get_me()
-
-        bot_username = me.username or ""
-
-    except Exception:
-
-        bot_username = ""
-
-    text = f"""
-• Hᴇʟʟᴏ, {user.mention_html()} 🇨🇦 ✨
-
-╭━━━━━━━━━━━━━━━━━━━━━━╮
-   ✦ Wᴇʟᴄᴏᴍᴇ Tᴏ
-      <b>Sʜɪᴇʟᴅ Gᴜᴀʀᴅ</b>
-   Pʀᴇᴍɪᴜᴍ Gʀᴏᴜᴘ Pʀᴏᴛᴇᴄᴛɪᴏɴ
-╰━━━━━━━━━━━━━━━━━━━━━━╯
-
-⚡ Bʟᴀᴢɪɴɢ Fᴀsᴛ Pʀᴏᴛᴇᴄᴛɪᴏɴ
-🛡️ Aᴜᴛᴏ Mᴏᴅᴇʀᴀᴛɪᴏɴ
-🔗 Aɴᴛɪ-Lɪɴᴋ Pʀᴏᴛᴇᴄᴛɪᴏɴ
-🌊 Aɴᴛɪ-Sᴘᴀᴍ Pʀᴏᴛᴇᴄᴛɪᴏɴ
-⚙️ Sᴍᴀʀᴛ Gʀᴏᴜᴘ Mᴏᴅᴇʀᴀᴛɪᴏɴ
-
-» Aᴅᴅ Mᴇ Tᴏ Yᴏᴜʀ Gʀᴏᴜᴘ
-» Gɪᴠᴇ Mᴇ <b>Dᴇʟᴇᴛᴇ Mᴇssᴀɢᴇs</b>
-  Pᴇʀᴍɪssɪᴏɴ.
-
-✦ Bᴜɪʟᴛ Fᴏʀ A Sᴀғᴇʀ Cᴏᴍᴍᴜɴɪᴛʏ.
-"""
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✚ Aᴅᴅ Mᴇ Iɴ Yᴏᴜʀ Gʀᴏᴜᴘ ✚",
-                url=(
-                    f"https://t.me/{bot_username}"
-                    "?startgroup=true"
-                )
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💬 Oᴡɴᴇʀ",
-                url=f"https://t.me/{OWNER_USERNAME}"
-            ),
-            InlineKeyboardButton(
-                "🧑‍💼 Sᴜᴘᴘᴏʀᴛ ↗",
-                url=f"https://t.me/{SUPPORT_USERNAME}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📚 Bᴏᴛ Cᴏᴍᴍᴀɴᴅ Hᴇʟᴘ",
-                callback_data="help_page_0"
-            )
-        ]
-    ])
-
-    await update.message.reply_text(
-        text,
-        reply_markup=keyboard,
-        parse_mode=ParseMode.HTML
+    await send_help(
+        update,
+        context,
+        0
     )
 
 # =========================================================
-# HELP TEXT
-# =========================================================
-
-
-HELP_PAGES = {
-
-    0: """
-📚 <b>Bᴏᴛ Cᴏᴍᴍᴀɴᴅ Hᴇʟᴘ</b>
-
-Hᴇʀᴇ Yᴏᴜ'ʟʟ Fɪɴᴅ Dᴇᴛᴀɪʟs
-Fᴏʀ Aʟʟ Aᴠᴀɪʟᴀʙʟᴇ Pʟᴜɢɪɴs
-Aɴᴅ Fᴇᴀᴛᴜʀᴇs.
-
-📌 Tᴀᴘ Tʜᴇ Bᴜᴛᴛᴏɴs Bᴇʟᴏᴡ
-Tᴏ Vɪᴇᴡ Hᴇʟᴘ Fᴏʀ Eᴀᴄʜ Mᴏᴅᴜʟᴇ:
-""",
-
-    1: """
-🔐 <b>Lᴏᴄᴀʟ Aᴜᴛʜ</b>
-
-🔐 /auth
-Aᴜᴛʜᴏʀɪᴢᴇ Rᴇᴘʟɪᴇᴅ Uѕᴇʀ
-
-🔓 /unauth
-Rᴇᴍᴏᴠᴇ Lᴏᴄᴀʟ Aᴜᴛʜ
-
-📋 /authlist
-Sʜᴏᴡ Lᴏᴄᴀʟ Aᴜᴛʜ Uѕᴇʀѕ
-
-✦ Oɴʟʏ Aᴅᴍɪɴѕ Cᴀɴ
-Mᴀɴᴀɢᴇ Lᴏᴄᴀʟ Aᴜᴛʜ.
-""",
-
-    2: """
-🛡️ <b>Bɪɢ-Mᴏᴅᴇ</b>
-
-🌐 /gauth
-Aᴅᴅ Gʟᴏʙᴀʟ Aᴜᴛʜ
-
-🚫 /gunauth
-Rᴇᴍᴏᴠᴇ Gʟᴏʙᴀʟ Aᴜᴛʜ
-
-👑 Oᴡɴᴇʀ Iѕ Aʟᴡᴀʏѕ
-Aᴜᴛʜᴏʀɪᴢᴇᴅ.
-""",
-
-    3: """
-📝 <b>Eᴄʜᴏ</b>
-
-⚙️ /settings
-
-🔗 /antilink on
-🔗 /antilink off
-
-🌊 /antispam on
-🌊 /antispam off
-
-✦ Cᴏɴᴛʀᴏʟ Yᴏᴜʀ Gʀᴏᴜᴘ
-Pʀᴏᴛᴇᴄᴛɪᴏɴ Fʀᴏᴍ Hᴇʀᴇ.
-""",
-
-    4: """
-🔗 <b>Lɪɴᴋ-Fɪʟᴛᴇʀ</b>
-
-Tʜᴇ Bᴏᴛ Dᴇᴛᴇᴄᴛs:
-
-• https://
-• http://
-• www.
-• t.me/
-• telegram.me/
-
-⚡ /antilink on
-⚡ /antilink off
-
-Gɪᴠᴇ Tʜᴇ Bᴏᴛ
-Dᴇʟᴇᴛᴇ Mᴇssᴀɢᴇѕ
-Pᴇʀᴍɪssɪᴏɴ.
-""",
-
-    5: """
-💬 <b>Mѕɢ-Dᴇʟᴇᴛᴇ</b>
-
-🗑️ /purge 20
-
-⚠️ /warn
-📊 /warnings
-♻️ /unwarn
-
-🚫 /ban
-🔓 /unban USER_ID
-👢 /kick
-
-🔇 /mute [minutes]
-🔊 /unmute
-""",
-
-    6: """
-🎬 <b>Mᴇᴅɪᴀ-Dᴇʟ</b>
-
-🗑️ /purge [count]
-
-⚡ Aᴜᴛᴏ Mᴇᴅɪᴀ
-Aɴᴅ Mᴇssᴀɢᴇ Mᴏᴅᴇʀᴀᴛɪᴏɴ
-
-✦ Rᴇᴘʟʏ Tᴏ A Uѕᴇʀ
-Fᴏʀ Mᴏᴅᴇʀᴀᴛɪᴏɴ.
-""",
-
-    7: """
-🚫 <b>Aʙᴜsᴇ</b>
-
-⚠️ /warn
-📊 /warnings
-♻️ /unwarn
-
-Mᴀx Wᴀʀɴɪɴɢs:
-<b>3</b>
-
-🚫 Aғᴛᴇʀ Mᴀx Wᴀʀɴɪɴɢs
-Tʜᴇ Uѕᴇʀ Cᴀɴ Bᴇ
-Aᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ Bᴀɴɴᴇᴅ.
-""",
-
-    8: """
-⚙️ <b>Oᴛʜᴇʀ Cᴏᴍᴍᴀɴᴅs</b>
-
-/start
-/help
-/settings
-
-🔗 /antilink on|off
-🌊 /antispam on|off
-
-✦ Kᴇᴇᴘ Yᴏᴜʀ Gʀᴏᴜᴘ
-Cʟᴇᴀɴ Aɴᴅ Sᴀғᴇ.
-"""
-}
-
-# =========================================================
-# HELP KEYBOARD
-# =========================================================
-
-
-def help_keyboard(page=0):
-
-    if page == 0:
-
-        return InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🚫 Aʙᴜsᴇ",
-                    callback_data="help_page_7"
-                ),
-                InlineKeyboardButton(
-                    "🛡️ Bɪɢ-Mᴏᴅᴇ",
-                    callback_data="help_page_2"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "📝 Eᴄʜᴏ",
-                    callback_data="help_page_3"
-                ),
-                InlineKeyboardButton(
-                    "🔗 Lɪɴᴋ-Fɪʟᴛᴇʀ",
-                    callback_data="help_page_4"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "💬 Mѕɢ-Dᴇʟᴇᴛᴇ",
-                    callback_data="help_page_5"
-                ),
-                InlineKeyboardButton(
-                    "🎬 Mᴇᴅɪᴀ-Dᴇʟ",
-                    callback_data="help_page_6"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🏠 Hᴏᴍᴇ",
-                    callback_data="help_page_0"
-                ),
-                InlineKeyboardButton(
-                    "Nᴇxᴛ ▶️",
-                    callback_data="help_page_1"
-                )
-            ]
-        ])
-
-    # -----------------------------------------------------
-    # PAGE NAVIGATION
-    # -----------------------------------------------------
-
-    next_page = page + 1
-
-    if next_page > 8:
-        next_page = 0
-
-    previous_page = page - 1
-
-    if previous_page < 0:
-        previous_page = 0
-
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "↩️ Bᴀᴄᴋ",
-                callback_data=f"help_page_{previous_page}"
-            ),
-            InlineKeyboardButton(
-                "🏠 Hᴏᴍᴇ",
-                callback_data="help_page_0"
-            ),
-            InlineKeyboardButton(
-                "Nᴇxᴛ ▶️",
-                callback_data=f"help_page_{next_page}"
-            )
-        ]
-    ])
-
-# =========================================================
-# HELP COMMAND
+# HELP
 # =========================================================
 
 
@@ -765,21 +924,15 @@ async def help_cmd(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.message:
+    await send_help(
+        update,
+        context,
+        0
+    )
 
-        await update.message.reply_text(
-            HELP_PAGES[0],
-            reply_markup=help_keyboard(0),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif update.callback_query:
-
-        await update.callback_query.edit_message_text(
-            HELP_PAGES[0],
-            reply_markup=help_keyboard(0),
-            parse_mode=ParseMode.HTML
-        )
+# =========================================================
+# HELP CALLBACK
+# =========================================================
 
 
 async def help_callback(
@@ -808,18 +961,18 @@ async def help_callback(
         0,
         min(
             page,
-            8
+            9
         )
     )
 
-    await query.edit_message_text(
-        HELP_PAGES[page],
-        reply_markup=help_keyboard(page),
-        parse_mode=ParseMode.HTML
+    await send_help(
+        update,
+        context,
+        page
     )
 
 # =========================================================
-# TOGGLE
+# GENERIC TOGGLE
 # =========================================================
 
 
@@ -830,7 +983,9 @@ async def toggle(
     name: str
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
     if not context.args:
@@ -841,7 +996,10 @@ async def toggle(
 
         return
 
-    option = context.args[0].lower()
+    option = (
+        context.args[0]
+        .lower()
+    )
 
     if option not in (
         "on",
@@ -854,7 +1012,11 @@ async def toggle(
 
         return
 
-    value = 1 if option == "on" else 0
+    value = (
+        1
+        if option == "on"
+        else 0
+    )
 
     await set_setting(
         update.effective_chat.id,
@@ -869,9 +1031,13 @@ async def toggle(
     )
 
     await update.message.reply_text(
-        f"✅ {name.upper()} <b>{status}</b>.",
+        f"✅ {name.upper()} <b>{status}</b>",
         parse_mode=ParseMode.HTML
     )
+
+# =========================================================
+# TOGGLE COMMANDS
+# =========================================================
 
 
 async def antilink(
@@ -899,6 +1065,58 @@ async def antispam(
         "antispam"
     )
 
+
+async def editdelete(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await toggle(
+        update,
+        context,
+        "edit_delete",
+        "editdelete"
+    )
+
+
+async def biolink(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await toggle(
+        update,
+        context,
+        "bio_link",
+        "biolink"
+    )
+
+
+async def mediadel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await toggle(
+        update,
+        context,
+        "media_delete",
+        "mediadel"
+    )
+
+
+async def abuse(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await toggle(
+        update,
+        context,
+        "abuse",
+        "abuse"
+    )
+
 # =========================================================
 # SETTINGS
 # =========================================================
@@ -909,10 +1127,12 @@ async def settings_cmd(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    settings = await get_settings(
+    s = await get_settings(
         update.effective_chat.id
     )
 
@@ -921,13 +1141,25 @@ async def settings_cmd(
 ⚙️ <b>Gʀᴏᴜᴘ Sᴇᴛᴛɪɴɢs</b>
 
 🔗 Aɴᴛɪ-Lɪɴᴋ:
-<b>{'Oɴ' if settings[0] else 'Oғғ'}</b>
+<b>{'Oɴ' if s[0] else 'Oғғ'}</b>
 
 🌊 Aɴᴛɪ-Sᴘᴀᴍ:
-<b>{'Oɴ' if settings[1] else 'Oғғ'}</b>
+<b>{'Oɴ' if s[1] else 'Oғғ'}</b>
 
 ⚠️ Mᴀx Wᴀʀɴɪɴɢs:
-<b>{settings[2]}</b>
+<b>{s[2]}</b>
+
+📝 Eᴅɪᴛ Dᴇʟᴇᴛᴇ:
+<b>{'Oɴ' if s[3] else 'Oғғ'}</b>
+
+🔗 Bɪᴏ Lɪɴᴋ:
+<b>{'Oɴ' if s[4] else 'Oғғ'}</b>
+
+🎬 Mᴇᴅɪᴀ Dᴇʟ:
+<b>{'Oɴ' if s[5] else 'Oғғ'}</b>
+
+🚫 Aʙᴜsᴇ:
+<b>{'Oɴ' if s[6] else 'Oғғ'}</b>
 """,
         parse_mode=ParseMode.HTML
     )
@@ -965,10 +1197,14 @@ async def warn(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1037,14 +1273,14 @@ async def warn(
 
             await update.message.reply_text(
                 f"🚫 {user.mention_html()} "
-                f"<b>Hᴀѕ Bᴇᴇɴ Bᴀɴɴᴇᴅ</b>.",
+                f"<b>Bᴀɴɴᴇᴅ Aғᴛᴇʀ Wᴀʀɴɪɴɢs</b>.",
                 parse_mode=ParseMode.HTML
             )
 
         except Exception as e:
 
             log.warning(
-                "Auto ban failed: %s",
+                "Auto-ban failed: %s",
                 e
             )
 
@@ -1070,7 +1306,7 @@ async def warnings(
 
     await update.message.reply_text(
         f"""
-⚠️ <b>Wᴀʀɴɪɴɢѕ</b>
+⚠️ <b>Wᴀʀɴɪɴɢs</b>
 
 👤 {user.mention_html()}
 📊 Cᴏᴜɴᴛ: <b>{count}</b>
@@ -1088,10 +1324,14 @@ async def unwarn(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1109,7 +1349,7 @@ async def unwarn(
 
     await update.message.reply_text(
         f"✅ {user.mention_html()} "
-        f"<b>Wᴀʀɴɪɴɢѕ Rᴇѕᴇᴛ</b>.",
+        f"<b>Wᴀʀɴɪɴɢs Rᴇѕᴇᴛ</b>.",
         parse_mode=ParseMode.HTML
     )
 
@@ -1123,10 +1363,14 @@ async def ban(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1175,7 +1419,9 @@ async def unban(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
     if not context.args:
@@ -1222,10 +1468,14 @@ async def kick(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1278,10 +1528,14 @@ async def mute(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1311,7 +1565,9 @@ async def mute(
             minutes = max(
                 1,
                 min(
-                    int(context.args[0]),
+                    int(
+                        context.args[0]
+                    ),
                     10080
                 )
             )
@@ -1327,8 +1583,10 @@ async def mute(
             ChatPermissions(
                 can_send_messages=False
             ),
-            until_date=int(time.time())
-            + minutes * 60
+            until_date=(
+                int(time.time())
+                + minutes * 60
+            )
         )
 
         await update.message.reply_text(
@@ -1357,10 +1615,14 @@ async def unmute(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1411,7 +1673,9 @@ async def purge(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
     count = 10
@@ -1423,7 +1687,9 @@ async def purge(
             count = max(
                 1,
                 min(
-                    int(context.args[0]),
+                    int(
+                        context.args[0]
+                    ),
                     100
                 )
             )
@@ -1493,10 +1759,14 @@ async def auth(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1523,10 +1793,14 @@ async def unauth(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1543,7 +1817,7 @@ async def unauth(
 
     await update.message.reply_text(
         f"🔓 {user.mention_html()} "
-        f"<b>Rᴇᴍᴏᴠᴇᴅ Fʀᴏᴍ Aᴜᴛʜ</b>.",
+        f"<b>Uɴᴀᴜᴛʜᴏʀɪᴢᴇᴅ</b>.",
         parse_mode=ParseMode.HTML
     )
 
@@ -1553,7 +1827,9 @@ async def authlist(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not await can_manage(update):
+    if not await can_manage(
+        update
+    ):
         return
 
     rows = db.execute(
@@ -1575,10 +1851,9 @@ async def authlist(
 
         return
 
-    text = """
-🔐 <b>Lᴏᴄᴀʟ Aᴜᴛʜ Lɪѕᴛ</b>
-
-"""
+    text = (
+        "🔐 <b>Lᴏᴄᴀʟ Aᴜᴛʜ</b>\n\n"
+    )
 
     for index, row in enumerate(
         rows,
@@ -1605,10 +1880,15 @@ async def gauth(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != OWNER_ID:
+    if (
+        not update.effective_user
+        or update.effective_user.id != OWNER_ID
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1634,10 +1914,15 @@ async def gunauth(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != OWNER_ID:
+    if (
+        not update.effective_user
+        or update.effective_user.id != OWNER_ID
+    ):
         return
 
-    user = await get_target(update)
+    user = await get_target(
+        update
+    )
 
     if not user:
 
@@ -1655,6 +1940,44 @@ async def gunauth(
         f"🌐 {user.mention_html()} "
         f"<b>Gʟᴏʙᴀʟ Aᴜᴛʜ Rᴇᴍᴏᴠᴇᴅ</b>.",
         parse_mode=ParseMode.HTML
+    )
+
+# =========================================================
+# MEDIA FILTER
+# =========================================================
+
+
+def is_media_message(message):
+
+    return any([
+        bool(message.photo),
+        bool(message.video),
+        bool(message.animation),
+        bool(message.document),
+        bool(message.audio),
+        bool(message.voice),
+        bool(message.video_note),
+        bool(message.sticker),
+    ])
+
+# =========================================================
+# ABUSE FILTER
+# =========================================================
+
+
+def contains_abuse(text):
+
+    if not text:
+        return False
+
+    words = re.findall(
+        r"[a-zA-Z]+",
+        text.lower()
+    )
+
+    return any(
+        word in ABUSE_WORDS
+        for word in words
     )
 
 # =========================================================
@@ -1684,21 +2007,30 @@ async def protection(
     ):
         return
 
-    # Admin bypass
+    # -----------------------------------------------------
+    # ADMIN BYPASS
+    # -----------------------------------------------------
+
     if await is_admin(
         update,
         user.id
     ):
         return
 
-    # Local auth bypass
+    # -----------------------------------------------------
+    # LOCAL AUTH BYPASS
+    # -----------------------------------------------------
+
     if await is_local_auth(
         chat.id,
         user.id
     ):
         return
 
-    # Global auth bypass
+    # -----------------------------------------------------
+    # GLOBAL AUTH BYPASS
+    # -----------------------------------------------------
+
     if await is_global_auth(
         user.id
     ):
@@ -1708,11 +2040,21 @@ async def protection(
         chat.id
     )
 
+    (
+        links,
+        flood,
+        max_warns,
+        edit_delete,
+        bio_link,
+        media_delete,
+        abuse_enabled,
+    ) = settings
+
     # -----------------------------------------------------
     # LINK FILTER
     # -----------------------------------------------------
 
-    if settings[0]:
+    if links:
 
         text = (
             message.text
@@ -1720,7 +2062,9 @@ async def protection(
             or ""
         )
 
-        if LINK_RE.search(text):
+        if LINK_RE.search(
+            text
+        ):
 
             try:
 
@@ -1729,9 +2073,9 @@ async def protection(
                 await log_action(
                     context,
                     (
-                        "🔗 Lɪɴᴋ Dᴇʟᴇᴛᴇᴅ\n"
-                        f"Cʜᴀᴛ: {chat.id}\n"
-                        f"Uѕᴇʀ: {user.id}"
+                        "🔗 LINK DELETED\n"
+                        f"CHAT: {chat.id}\n"
+                        f"USER: {user.id}"
                     )
                 )
 
@@ -1745,10 +2089,107 @@ async def protection(
             return
 
     # -----------------------------------------------------
+    # MEDIA DELETE
+    # -----------------------------------------------------
+
+    if media_delete:
+
+        if is_media_message(
+            message
+        ):
+
+            try:
+
+                await message.delete()
+
+            except Exception:
+
+                pass
+
+            return
+
+    # -----------------------------------------------------
+    # ABUSE FILTER
+    # -----------------------------------------------------
+
+    if abuse_enabled:
+
+        text = (
+            message.text
+            or message.caption
+            or ""
+        )
+
+        if contains_abuse(
+            text
+        ):
+
+            try:
+
+                await message.delete()
+
+                count = (
+                    await get_warn_count(
+                        chat.id,
+                        user.id
+                    )
+                    + 1
+                )
+
+                await set_warn_count(
+                    chat.id,
+                    user.id,
+                    count
+                )
+
+                if count >= max_warns:
+
+                    await chat.ban_member(
+                        user.id
+                    )
+
+                    await set_warn_count(
+                        chat.id,
+                        user.id,
+                        0
+                    )
+
+                else:
+
+                    try:
+
+                        warn_msg = await context.bot.send_message(
+                            chat.id,
+                            (
+                                f"⚠️ {user.mention_html()} "
+                                f"<b>Wᴀʀɴᴇᴅ</b>\n"
+                                f"📊 {count}/{max_warns}"
+                            ),
+                            parse_mode=ParseMode.HTML
+                        )
+
+                        await asyncio.sleep(3)
+
+                        await warn_msg.delete()
+
+                    except Exception:
+
+                        pass
+
+            except Exception as e:
+
+                log.warning(
+                    "Abuse action failed: %s",
+                    e
+                )
+
+            return
+
+    # -----------------------------------------------------
     # ANTI SPAM
     # -----------------------------------------------------
 
-    if settings[1]:
+    if flood:
 
         now = time.time()
 
@@ -1756,7 +2197,9 @@ async def protection(
             chat.id
         ][user.id]
 
-        queue.append(now)
+        queue.append(
+            now
+        )
 
         while queue and (
             now - queue[0] > 8
@@ -1773,9 +2216,10 @@ async def protection(
                     ChatPermissions(
                         can_send_messages=False
                     ),
-                    until_date=int(
-                        time.time()
-                    ) + 60
+                    until_date=(
+                        int(time.time())
+                        + 60
+                    )
                 )
 
                 await message.delete()
@@ -1785,9 +2229,9 @@ async def protection(
                 await log_action(
                     context,
                     (
-                        "🌊 Sᴘᴀᴍ Uѕᴇʀ Mᴜᴛᴇᴅ\n"
-                        f"Cʜᴀᴛ: {chat.id}\n"
-                        f"Uѕᴇʀ: {user.id}"
+                        "🌊 SPAM USER MUTED\n"
+                        f"CHAT: {chat.id}\n"
+                        f"USER: {user.id}"
                     )
                 )
 
@@ -1826,201 +2270,241 @@ def main():
             "BOT_TOKEN environment variable is missing."
         )
 
-    application = (
+    app = (
         Application
         .builder()
         .token(TOKEN)
         .build()
     )
 
-    # -----------------------------------------------------
-    # BASIC
-    # -----------------------------------------------------
+    # =====================================================
+    # START / HELP
+    # =====================================================
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "start",
             start
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "help",
             help_cmd
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "settings",
             settings_cmd
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # PROTECTION
-    # -----------------------------------------------------
+    # =====================================================
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "antilink",
             antilink
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "antispam",
             antispam
         )
     )
 
-    # -----------------------------------------------------
-    # MODERATION
-    # -----------------------------------------------------
+    app.add_handler(
+        CommandHandler(
+            "editdelete",
+            editdelete
+        )
+    )
 
-    application.add_handler(
+    app.add_handler(
+        CommandHandler(
+            "biolink",
+            biolink
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "mediadel",
+            mediadel
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "abuse",
+            abuse
+        )
+    )
+
+    # =====================================================
+    # MODERATION
+    # =====================================================
+
+    app.add_handler(
         CommandHandler(
             "warn",
             warn
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "warnings",
             warnings
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "unwarn",
             unwarn
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "ban",
             ban
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "unban",
             unban
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "kick",
             kick
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "mute",
             mute
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "unmute",
             unmute
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "purge",
             purge
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # LOCAL AUTH
-    # -----------------------------------------------------
+    # =====================================================
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "auth",
             auth
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "unauth",
             unauth
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "authlist",
             authlist
         )
     )
 
-    # -----------------------------------------------------
+    # =====================================================
     # GLOBAL AUTH
-    # -----------------------------------------------------
+    # =====================================================
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "gauth",
             gauth
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         CommandHandler(
             "gunauth",
             gunauth
         )
     )
 
-    # -----------------------------------------------------
-    # HELP CALLBACK
-    # -----------------------------------------------------
+    # =====================================================
+    # HELP BUTTON CALLBACK
+    # =====================================================
 
-    application.add_handler(
+    app.add_handler(
         CallbackQueryHandler(
             help_callback,
             pattern=r"^help_page_"
         )
     )
 
-    # -----------------------------------------------------
-    # MESSAGE PROTECTION
-    # -----------------------------------------------------
+    # =====================================================
+    # GROUP PROTECTION
+    # =====================================================
 
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.ALL & ~filters.COMMAND,
             protection
         )
     )
 
-    application.add_error_handler(
+    # =====================================================
+    # ERROR
+    # =====================================================
+
+    app.add_error_handler(
         error_handler
     )
 
     log.info(
-        "🛡️ Sʜɪᴇʟᴅ Gᴜᴀʀᴅ Sᴛᴀʀᴛᴇᴅ."
+        "🛡️ Sʜɪᴇʟᴅ Gᴜᴀʀᴅ Bᴏᴛ Sᴛᴀʀᴛᴇᴅ."
     )
 
-    application.run_polling(
+    # =====================================================
+    # RUN
+    # =====================================================
+
+    app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
     )
 
+
+# =========================================================
+# START BOT
+# =========================================================
 
 if __name__ == "__main__":
     main()
