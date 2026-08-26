@@ -1,5 +1,4 @@
-{
-  "name": "ᴋɪʀᴛɪ ɢᴜʀᴀᴅ ʙᴏᴛ",
+  "name": "Shield Guard Telegram Bot",
   "description": "Telegram group security and moderation bot",
   "keywords": [
     "telegram",
@@ -36,21 +35,6 @@
       "description": "SQLite database path",
       "required": false,
       "value": "shieldbot.db"
-    },
-    "SIGHTENGINE_USER": {
-      "description": "Sightengine API user for NSFW moderation",
-      "required": false,
-      "value": ""
-    },
-    "SIGHTENGINE_SECRET": {
-      "description": "Sightengine API secret for NSFW moderation",
-      "required": false,
-      "value": ""
-    },
-    "NSFW_THRESHOLD": {
-      "description": "NSFW deletion threshold, e.g. 0.70",
-      "required": false,
-      "value": "0.70"
     },
     "MONGO_DB_URI": {
       "description": "MongoDB Atlas connection string",
