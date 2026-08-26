@@ -1,10 +1,10 @@
+{
   "name": "Shield Guard Telegram Bot",
   "description": "Telegram group security and moderation bot",
   "keywords": [
     "telegram",
     "moderation",
     "antispam",
-    "heroku",
     "python"
   ],
   "env": {
@@ -13,7 +13,7 @@
       "required": true
     },
     "OWNER_ID": {
-      "description": "Your Telegram numeric user ID for owner-only commands",
+      "description": "Telegram numeric user ID for owner-only commands",
       "required": true
     },
     "OWNER_USERNAME": {
@@ -31,11 +31,6 @@
       "required": false,
       "value": ""
     },
-    "DB_PATH": {
-      "description": "SQLite database path",
-      "required": false,
-      "value": "shieldbot.db"
-    },
     "MONGO_DB_URI": {
       "description": "MongoDB Atlas connection string",
       "required": false,
@@ -46,16 +41,5 @@
       "required": false,
       "value": "shield_guard"
     }
-  },
-  "formation": {
-    "worker": {
-      "quantity": 1,
-      "size": "eco"
-    }
-  },
-  "buildpacks": [
-    {
-      "url": "heroku/python"
-    }
-  ]
+  }
 }
