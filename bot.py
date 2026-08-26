@@ -1,12 +1,8 @@
 import os
 import re
 import time
-import io
-import asyncio
 import logging
 from collections import defaultdict, deque
-
-import requests
 import motor.motor_asyncio
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,10 +19,6 @@ LOG_CHAT = os.getenv("LOG_CHAT_ID", "")
 MONGO_DB_URI = os.getenv("MONGO_DB_URI", "").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "shield_guard")
 DB_PATH = os.getenv("DB_PATH", "shieldbot.db")
-
-SIGHTENGINE_USER = os.getenv("SIGHTENGINE_USER", "")
-SIGHTENGINE_SECRET = os.getenv("SIGHTENGINE_SECRET", "")
-NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.70") or 0.70)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("shieldbot")
@@ -51,8 +43,7 @@ else:
     sqlite_db.execute("""CREATE TABLE IF NOT EXISTS settings(
         chat_id INTEGER PRIMARY KEY, links INTEGER DEFAULT 1, flood INTEGER DEFAULT 1,
         welcome INTEGER DEFAULT 0, max_warns INTEGER DEFAULT 3, edit_delete INTEGER DEFAULT 0,
-        bio_link INTEGER DEFAULT 0, media_del INTEGER DEFAULT 0, no_abuse INTEGER DEFAULT 0,
-        nsfw INTEGER DEFAULT 0)""")
+        bio_link INTEGER DEFAULT 0, media_del INTEGER DEFAULT 0, no_abuse INTEGER DEFAULT 0)""")
     sqlite_db.execute("""CREATE TABLE IF NOT EXISTS warns(
         chat_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0,
         PRIMARY KEY(chat_id,user_id))""")
@@ -64,7 +55,7 @@ else:
 
 DEFAULT_SETTINGS = {
     "links": 1, "flood": 1, "welcome": 0, "max_warns": 3,
-    "edit_delete": 0, "bio_link": 0, "media_del": 0, "no_abuse": 0, "nsfw": 0
+    "edit_delete": 0, "bio_link": 0, "media_del": 0, "no_abuse": 0
 }
 
 ABUSE_WORDS = {
@@ -103,7 +94,7 @@ async def get_settings(chat_id):
         return tuple(row.get(k, v) for k, v in DEFAULT_SETTINGS.items())
 
     row = sqlite_db.execute(
-        "SELECT links,flood,welcome,max_warns,edit_delete,bio_link,media_del,no_abuse,nsfw "
+        "SELECT links,flood,welcome,max_warns,edit_delete,bio_link,media_del,no_abuse "
         "FROM settings WHERE chat_id=?", (chat_id,)
     ).fetchone()
     if not row:
@@ -279,8 +270,7 @@ HELP = {
 "help_edit_delete": "✏️ <b>EDIT DELETE</b>\n\n/editdelete on|off",
 "help_bio_link": "🔗 <b>BIO LINK</b>\n\n/biolink on|off",
 "help_media_del": "🧹 <b>MEDIA DEL</b>\n\n/mediadel on|off",
-"help_no_abuse": "🛡️ <b>NO ABUSE</b>\n\n/noabuse on|off",
-"help_nsfw": "🔞 <b>NSFW DEL</b>\n\n/nsfw on|off\nRequires SIGHTENGINE_USER and SIGHTENGINE_SECRET."
+"help_no_abuse": "🛡️ <b>NO ABUSE</b>\n\n/noabuse on|off"
 }
 
 
@@ -296,7 +286,6 @@ def help_keyboard():
          InlineKeyboardButton("BIO LINK", callback_data="help_bio_link")],
         [InlineKeyboardButton("MEDIA DEL", callback_data="help_media_del"),
          InlineKeyboardButton("NO ABUSE", callback_data="help_no_abuse")],
-        [InlineKeyboardButton("🔞 NSFW DEL", callback_data="help_nsfw")],
         [InlineKeyboardButton("BACK ↩", callback_data="help_back"),
          InlineKeyboardButton("• HOME •", callback_data="help_home"),
          InlineKeyboardButton("NEXT", callback_data="help_next")]
@@ -333,7 +322,6 @@ async def help_callback(update, context):
              InlineKeyboardButton("BIO LINK",callback_data="help_bio_link")],
             [InlineKeyboardButton("MEDIA DEL",callback_data="help_media_del"),
              InlineKeyboardButton("NO ABUSE",callback_data="help_no_abuse")],
-            [InlineKeyboardButton("🔞 NSFW DEL",callback_data="help_nsfw")],
             [InlineKeyboardButton("BACK ↩",callback_data="help_back"),
              InlineKeyboardButton("• HOME •",callback_data="help_home")]
         ])
@@ -364,7 +352,6 @@ async def settings_cmd(update, context):
         f"🔗 Bio-link: {'ON' if s[5] else 'OFF'}\n"
         f"🧹 Media-delete: {'ON' if s[6] else 'OFF'}\n"
         f"🛡️ No-abuse: {'ON' if s[7] else 'OFF'}\n"
-        f"🔞 NSFW-delete: {'ON' if s[8] else 'OFF'}\n"
         f"⚠️ Max warnings: {s[3]}",
         parse_mode="HTML"
     )
@@ -539,43 +526,6 @@ async def broadcast(update, context):
     await update.message.reply_text("📢 Broadcast is disabled in this build.")
 
 
-async def check_nsfw(media_bytes, filename):
-    if not SIGHTENGINE_USER or not SIGHTENGINE_SECRET:
-        return False
-    def run():
-        try:
-            r=requests.post(
-                "https://api.sightengine.com/1.0/check.json",
-                params={"models":"nudity-2.1","api_user":SIGHTENGINE_USER,"api_secret":SIGHTENGINE_SECRET},
-                files={"media":(filename,media_bytes)}, timeout=30)
-            r.raise_for_status()
-            n=r.json().get("nudity",{})
-            return max(float(n.get("raw",0) or 0),float(n.get("sexual_activity",0) or 0),
-                       float(n.get("sexual_display",0) or 0),float(n.get("erotica",0) or 0)) >= NSFW_THRESHOLD
-        except Exception as e:
-            log.warning("NSFW API error: %s",e)
-            return False
-    return await asyncio.to_thread(run)
-
-
-async def check_nsfw_media(update, context):
-    m=update.effective_message
-    if not m or not (m.photo or m.video or m.animation): return False
-    try:
-        if m.photo:
-            f=await context.bot.get_file(m.photo[-1].file_id); name="photo.jpg"
-        elif m.video:
-            f=await context.bot.get_file(m.video.file_id); name="video.mp4"
-        else:
-            f=await context.bot.get_file(m.animation.file_id); name="animation.mp4"
-        buf=io.BytesIO()
-        await f.download_to_memory(out=buf)
-        if await check_nsfw(buf.getvalue(),name):
-            await m.delete()
-            return True
-    except Exception as e:
-        log.warning("NSFW check failed: %s",e)
-    return False
 
 
 async def on_message(update, context):
@@ -583,8 +533,6 @@ async def on_message(update, context):
     if not m or not update.effective_chat or not update.effective_user: return
     if await can_manage(update,m.from_user.id): return
     s=await get_settings(m.chat.id)
-
-    if s[8] and await check_nsfw_media(update,context): return
 
     if s[0] and (m.text or m.caption) and LINK_RE.search(m.text or m.caption):
         try: await m.delete()
@@ -647,7 +595,6 @@ def main():
         ("biolink",lambda u,c: toggle(u,c,"bio_link","biolink")),
         ("mediadel",lambda u,c: toggle(u,c,"media_del","mediadel")),
         ("noabuse",lambda u,c: toggle(u,c,"no_abuse","noabuse")),
-        ("nsfw",lambda u,c: toggle(u,c,"nsfw","nsfw")),
     ]:
         app.add_handler(CommandHandler(cmd,func))
 
