@@ -28,9 +28,12 @@ from telegram.ext import (
 # python-telegram-bot
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "8849771441:AAEFWBaEp3XkySFWvIEmaL0AIE782M3oWII").strip()
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-OWNER_ID = int(os.getenv("OWNER_ID", "8857291657") or 0)
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+except (TypeError, ValueError):
+    OWNER_ID = 0
 
 OWNER_USERNAME = os.getenv(
     "OWNER_USERNAME",
@@ -740,6 +743,19 @@ async def start(update, context):
         reply_markup=markup,
         parse_mode=ParseMode.HTML,
     )
+
+
+# =========================================================
+# PING / DIAGNOSTIC
+# =========================================================
+
+async def ping(update, context):
+    if not update.message:
+        return
+    try:
+        await update.message.reply_text("🏓 <b>Pᴏɴɢ!</b> Bot is online.", parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        log.exception("Ping reply failed: %s", e)
 
 
 # =========================================================
@@ -2405,6 +2421,13 @@ async def error_handler(update, context):
 
     error = context.error
 
+    log.error(
+        "Update handling error | update=%r | error=%r",
+        update,
+        error,
+        exc_info=(type(error), error, error.__traceback__) if error else None,
+    )
+
     if isinstance(
         error,
         RetryAfter,
@@ -2504,9 +2527,14 @@ async def post_init(application):
 def main():
 
     if not TOKEN:
-
         raise RuntimeError(
-            "BOT_TOKEN environment variable is missing."
+            "BOT_TOKEN environment variable is missing. "
+            "Set BOT_TOKEN in Heroku Config Vars."
+        )
+
+    if not OWNER_ID:
+        log.warning(
+            "OWNER_ID is not configured. Owner-only commands will be unavailable."
         )
 
     application = (
@@ -2531,6 +2559,13 @@ def main():
         CommandHandler(
             "help",
             help_cmd,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "ping",
+            ping,
         )
     )
 
