@@ -681,7 +681,7 @@ def home_text(user):
 ✦ <b>Hᴇʟʟᴏ, {user.mention_html()}!</b> ✨
 
 ╭━━━━━━━━━━━━━━━━━━╮
-│ 🛡️ <b>Sʜɪᴇʟᴅ Gᴜᴀʀᴅ</b>
+│ 🛡️ <b>𝐊ɪʀᴛɪ Gᴜᴀʀᴅ</b>
 │
 │ ⚡ <b>Fᴀsᴛ & Sᴍᴀʀᴛ Pʀᴏᴛᴇᴄᴛɪᴏɴ</b>
 │ 🔗 <b>Aɴᴛɪ-Lɪɴᴋ</b>
@@ -2788,7 +2788,7 @@ def main():
     # -----------------------------------------------------
 
     log.info(
-        "Starting Shield Guard..."
+        "Starting ᴋɪʀᴛɪ Guard..."
     )
 
     application.run_polling(
