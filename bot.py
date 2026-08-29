@@ -28,7 +28,7 @@ from telegram.ext import (
 # python-telegram-bot
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TOKEN = os.getenv("BOT_TOKEN", "8849771441:AAEFWBaEp3XkySFWvIEmaL0AIE782M3oWII").strip()
 
 OWNER_ID = int(os.getenv("OWNER_ID", "8857291657") or 0)
 
